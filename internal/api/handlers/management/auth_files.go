@@ -756,6 +756,7 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
 	}
+	coreauth.HydrateRuntimeStateFromMetadata(auth)
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
 	}

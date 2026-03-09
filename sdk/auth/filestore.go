@@ -43,6 +43,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 	if auth == nil {
 		return "", fmt.Errorf("auth filestore: auth is nil")
 	}
+	auth.PersistRuntimeStateToMetadata()
 
 	path, err := s.resolveAuthPath(auth)
 	if err != nil {
@@ -251,6 +252,7 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 		LastRefreshedAt:  time.Time{},
 		NextRefreshAfter: time.Time{},
 	}
+	cliproxyauth.HydrateRuntimeStateFromMetadata(auth)
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		auth.Attributes["email"] = email
 	}

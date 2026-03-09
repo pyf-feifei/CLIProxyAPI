@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -63,6 +64,7 @@ const (
 	refreshMaxConcurrency = 16
 	refreshPendingBackoff = time.Minute
 	refreshFailureBackoff = 5 * time.Minute
+	refreshReauthBackoff  = 24 * time.Hour
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
 )
@@ -2328,10 +2330,13 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 	}
 	ctx, cancel := context.WithCancel(parent)
 	m.refreshCancel = cancel
+	eagerStart := !strings.EqualFold(strings.TrimSpace(os.Getenv("DEPLOY")), "cloud")
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		m.checkRefreshes(ctx)
+		if eagerStart {
+			m.checkRefreshes(ctx)
+		}
 		for {
 			select {
 			case <-ctx.Done():
@@ -2641,16 +2646,23 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
+		var persistSnapshot *Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-			current.LastError = &Error{Message: err.Error()}
+			applyRefreshFailureState(current, err, now)
 			m.auths[id] = current
+			current.PersistRuntimeStateToMetadata()
+			persistSnapshot = current.Clone()
 			if m.scheduler != nil {
-				m.scheduler.upsertAuth(current.Clone())
+				m.scheduler.upsertAuth(persistSnapshot)
 			}
 		}
 		m.mu.Unlock()
+		if persistSnapshot != nil {
+			if errPersist := m.persist(context.Background(), persistSnapshot); errPersist != nil {
+				log.Warnf("persist refresh failure state for %s failed: %v", persistSnapshot.ID, errPersist)
+			}
+		}
 		return
 	}
 	if updated == nil {
@@ -2662,10 +2674,42 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		updated.Runtime = auth.Runtime
 	}
 	updated.LastRefreshedAt = now
+	updated.Unavailable = false
+	updated.Status = StatusActive
+	updated.StatusMessage = ""
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastError = nil
 	updated.UpdatedAt = now
 	_, _ = m.Update(ctx, updated)
+}
+
+func applyRefreshFailureState(auth *Auth, err error, now time.Time) {
+	if auth == nil {
+		return
+	}
+
+	resultErr := &Error{Message: err.Error()}
+	auth.LastError = resultErr
+	auth.Status = StatusError
+	auth.Unavailable = false
+	auth.UpdatedAt = now
+
+	if isReauthRequiredRefreshError(err) {
+		auth.StatusMessage = "refresh token invalid; sign in again"
+		auth.NextRefreshAfter = now.Add(refreshReauthBackoff)
+		return
+	}
+
+	auth.StatusMessage = "token refresh failed"
+	auth.NextRefreshAfter = now.Add(refreshFailureBackoff)
+}
+
+func isReauthRequiredRefreshError(err error) bool {
+	if err == nil {
+		return false
+	}
+	raw := strings.ToLower(err.Error())
+	return strings.Contains(raw, "refresh_token_reused")
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {

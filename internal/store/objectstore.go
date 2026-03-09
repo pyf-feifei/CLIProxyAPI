@@ -160,6 +160,7 @@ func (s *ObjectTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (s
 	if auth == nil {
 		return "", fmt.Errorf("object store: auth is nil")
 	}
+	auth.PersistRuntimeStateToMetadata()
 
 	path, err := s.resolveAuthPath(auth)
 	if err != nil {
@@ -595,6 +596,7 @@ func (s *ObjectTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Aut
 		LastRefreshedAt:  time.Time{},
 		NextRefreshAfter: time.Time{},
 	}
+	cliproxyauth.HydrateRuntimeStateFromMetadata(auth)
 	return auth, nil
 }
 

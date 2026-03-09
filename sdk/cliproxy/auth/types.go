@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -125,6 +126,17 @@ type ModelState struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+const (
+	metadataStatusKey          = "status"
+	metadataStatusMessageKey   = "status_message"
+	metadataUnavailableKey     = "unavailable"
+	metadataNextRefreshAfter   = "next_refresh_after"
+	metadataNextRetryAfter     = "next_retry_after"
+	metadataLastErrorKey       = "last_error"
+	metadataLastRefreshKey     = "last_refresh"
+	metadataLastRefreshedAtKey = "last_refreshed_at"
+)
+
 // Clone shallow copies the Auth structure, duplicating maps to avoid accidental mutation.
 func (a *Auth) Clone() *Auth {
 	if a == nil {
@@ -151,6 +163,110 @@ func (a *Auth) Clone() *Auth {
 	}
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth
+}
+
+// PersistRuntimeStateToMetadata mirrors runtime auth state into metadata so stores that only
+// persist metadata can restore refresh cooldowns and operator-facing status after restarts.
+func (a *Auth) PersistRuntimeStateToMetadata() {
+	if a == nil {
+		return
+	}
+	if a.Metadata == nil {
+		a.Metadata = make(map[string]any)
+	}
+
+	a.Metadata["disabled"] = a.Disabled
+
+	if status := strings.TrimSpace(string(a.Status)); status != "" && a.Status != StatusActive {
+		a.Metadata[metadataStatusKey] = status
+	} else {
+		delete(a.Metadata, metadataStatusKey)
+	}
+
+	if msg := strings.TrimSpace(a.StatusMessage); msg != "" {
+		a.Metadata[metadataStatusMessageKey] = msg
+	} else {
+		delete(a.Metadata, metadataStatusMessageKey)
+	}
+
+	if a.Unavailable {
+		a.Metadata[metadataUnavailableKey] = true
+	} else {
+		delete(a.Metadata, metadataUnavailableKey)
+	}
+
+	if !a.LastRefreshedAt.IsZero() {
+		ts := a.LastRefreshedAt.UTC().Format(time.RFC3339)
+		a.Metadata[metadataLastRefreshKey] = ts
+		a.Metadata[metadataLastRefreshedAtKey] = ts
+	} else {
+		delete(a.Metadata, metadataLastRefreshKey)
+		delete(a.Metadata, metadataLastRefreshedAtKey)
+	}
+
+	if !a.NextRefreshAfter.IsZero() {
+		a.Metadata[metadataNextRefreshAfter] = a.NextRefreshAfter.UTC().Format(time.RFC3339)
+	} else {
+		delete(a.Metadata, metadataNextRefreshAfter)
+	}
+
+	if !a.NextRetryAfter.IsZero() {
+		a.Metadata[metadataNextRetryAfter] = a.NextRetryAfter.UTC().Format(time.RFC3339)
+	} else {
+		delete(a.Metadata, metadataNextRetryAfter)
+	}
+
+	if a.LastError != nil {
+		a.Metadata[metadataLastErrorKey] = map[string]any{
+			"code":        strings.TrimSpace(a.LastError.Code),
+			"message":     strings.TrimSpace(a.LastError.Message),
+			"retryable":   a.LastError.Retryable,
+			"http_status": a.LastError.HTTPStatus,
+		}
+	} else {
+		delete(a.Metadata, metadataLastErrorKey)
+	}
+}
+
+// HydrateRuntimeStateFromMetadata restores persisted runtime auth state from metadata.
+func HydrateRuntimeStateFromMetadata(a *Auth) {
+	if a == nil || a.Metadata == nil {
+		return
+	}
+
+	if disabled, ok := parseBoolAny(a.Metadata["disabled"]); ok {
+		a.Disabled = disabled
+	}
+
+	if statusRaw := metadataString(a.Metadata[metadataStatusKey]); statusRaw != "" {
+		a.Status = Status(strings.ToLower(statusRaw))
+	}
+	if a.Disabled {
+		a.Status = StatusDisabled
+	} else if a.Status == "" {
+		a.Status = StatusActive
+	}
+
+	if msg := metadataString(a.Metadata[metadataStatusMessageKey]); msg != "" {
+		a.StatusMessage = msg
+	}
+
+	if unavailable, ok := parseBoolAny(a.Metadata[metadataUnavailableKey]); ok {
+		a.Unavailable = unavailable
+	}
+
+	if ts, ok := lookupMetadataTime(a.Metadata, metadataLastRefreshKey, metadataLastRefreshedAtKey, "lastRefresh", "lastRefreshedAt"); ok {
+		a.LastRefreshedAt = ts
+	}
+	if ts, ok := lookupMetadataTime(a.Metadata, metadataNextRefreshAfter, "nextRefreshAfter"); ok {
+		a.NextRefreshAfter = ts
+	}
+	if ts, ok := lookupMetadataTime(a.Metadata, metadataNextRetryAfter, "nextRetryAfter"); ok {
+		a.NextRetryAfter = ts
+	}
+	if lastErr := metadataError(a.Metadata[metadataLastErrorKey]); lastErr != nil {
+		a.LastError = lastErr
+	}
 }
 
 func stableAuthIndex(seed string) string {
@@ -309,6 +425,22 @@ func parseBoolAny(val any) (bool, bool) {
 		return parsed != 0, true
 	default:
 		return false, false
+	}
+}
+
+func metadataString(val any) string {
+	if val == nil {
+		return ""
+	}
+	switch typed := val.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case json.Number:
+		return strings.TrimSpace(typed.String())
+	case fmt.Stringer:
+		return strings.TrimSpace(typed.String())
+	default:
+		return strings.TrimSpace(fmt.Sprint(val))
 	}
 }
 
@@ -512,6 +644,45 @@ func parseTimeValue(v any) (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
+}
+
+func metadataError(raw any) *Error {
+	switch typed := raw.(type) {
+	case nil:
+		return nil
+	case string:
+		msg := strings.TrimSpace(typed)
+		if msg == "" {
+			return nil
+		}
+		return &Error{Message: msg}
+	case map[string]any:
+		err := &Error{}
+		if code := metadataString(typed["code"]); code != "" {
+			err.Code = code
+		}
+		if msg := metadataString(typed["message"]); msg != "" {
+			err.Message = msg
+		}
+		if retryable, ok := parseBoolAny(typed["retryable"]); ok {
+			err.Retryable = retryable
+		}
+		if status, ok := parseIntAny(typed["http_status"]); ok {
+			err.HTTPStatus = status
+		} else if status, ok := parseIntAny(typed["httpStatus"]); ok {
+			err.HTTPStatus = status
+		}
+		if err.Code == "" && err.Message == "" && err.HTTPStatus == 0 && !err.Retryable {
+			return nil
+		}
+		return err
+	default:
+		msg := metadataString(raw)
+		if msg == "" {
+			return nil
+		}
+		return &Error{Message: msg}
+	}
 }
 
 func normaliseUnix(raw int64) time.Time {

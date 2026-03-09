@@ -217,6 +217,7 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 	if auth == nil {
 		return "", fmt.Errorf("auth filestore: auth is nil")
 	}
+	auth.PersistRuntimeStateToMetadata()
 
 	path, err := s.resolveAuthPath(auth)
 	if err != nil {
@@ -443,6 +444,7 @@ func (s *GitTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth, 
 		LastRefreshedAt:  time.Time{},
 		NextRefreshAfter: time.Time{},
 	}
+	cliproxyauth.HydrateRuntimeStateFromMetadata(auth)
 	if email, ok := metadata["email"].(string); ok && email != "" {
 		auth.Attributes["email"] = email
 	}

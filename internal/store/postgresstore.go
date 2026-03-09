@@ -190,6 +190,7 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 	if auth == nil {
 		return "", fmt.Errorf("postgres store: auth is nil")
 	}
+	auth.PersistRuntimeStateToMetadata()
 
 	path, err := s.resolveAuthPath(auth)
 	if err != nil {
@@ -310,6 +311,7 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 			LastRefreshedAt:  time.Time{},
 			NextRefreshAfter: time.Time{},
 		}
+		cliproxyauth.HydrateRuntimeStateFromMetadata(auth)
 		auths = append(auths, auth)
 	}
 	if err = rows.Err(); err != nil {
