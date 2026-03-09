@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -629,6 +630,14 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
+
+	// PaaS platforms (Hugging Face Spaces, Heroku, etc.) inject PORT at runtime.
+	// Override config port when PORT is set so the app binds to the expected port.
+	if portEnv := strings.TrimSpace(os.Getenv("PORT")); portEnv != "" {
+		if p, err := strconv.Atoi(portEnv); err == nil && p > 0 {
+			cfg.Port = p
+		}
+	}
 
 	// NOTE: Legacy migration persistence is intentionally disabled together with
 	// startup legacy migration to keep startup read-only for config.yaml.
