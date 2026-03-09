@@ -11,6 +11,54 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoUrl = "https://huggingface.co/spaces/$HfUsername/$SpaceName"
+$sourceRoot = (Resolve-Path (Join-Path $PSScriptRoot ".")).Path
+
+function Invoke-Git {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string[]]$Arguments,
+
+        [string]$WorkingDirectory = $sourceRoot
+    )
+
+    & git -C $WorkingDirectory @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "git command failed: git -C $WorkingDirectory $($Arguments -join ' ')"
+    }
+}
+
+function Export-HfSnapshot {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$DestinationRoot
+    )
+
+    # Hugging Face Spaces rejects binary objects in regular git history.
+    # Export a clean tracked-files snapshot and skip image assets that trigger pre-receive rejection.
+    $trackedFiles = & git -C $sourceRoot ls-files
+    if ($LASTEXITCODE -ne 0) {
+        throw "failed to enumerate tracked files from $sourceRoot"
+    }
+
+    foreach ($relativePath in $trackedFiles) {
+        if ($relativePath -match '\.(png|jpg|jpeg|gif|webp)$') {
+            continue
+        }
+
+        $sourcePath = Join-Path $sourceRoot $relativePath
+        if (-not (Test-Path $sourcePath -PathType Leaf)) {
+            continue
+        }
+
+        $targetPath = Join-Path $DestinationRoot $relativePath
+        $targetDir = Split-Path $targetPath -Parent
+        if ($targetDir -and -not (Test-Path $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        }
+
+        Copy-Item $sourcePath $targetPath -Force
+    }
+}
 
 Write-Host "=== CLIProxyAPI Hugging Face Spaces 部署 ===" -ForegroundColor Cyan
 Write-Host "目标: $repoUrl" -ForegroundColor Gray
@@ -26,19 +74,36 @@ if (-not $whoami) {
 
 Write-Host "已登录: $whoami" -ForegroundColor Green
 
-# 添加或更新 HF 远程
-$existing = git remote get-url hf 2>$null
-if ($existing) {
-    git remote set-url hf $repoUrl
-    Write-Host "已更新 HF 远程: $repoUrl" -ForegroundColor Gray
-} else {
-    git remote add hf $repoUrl
-    Write-Host "已添加 HF 远程: $repoUrl" -ForegroundColor Gray
-}
+Write-Host "源目录: $sourceRoot" -ForegroundColor Gray
 
-# 推送
-Write-Host "`n正在推送到 Hugging Face Spaces..." -ForegroundColor Cyan
-git push hf main
+$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("CLIProxyAPI-hf-" + [Guid]::NewGuid().ToString("N"))
+
+try {
+    New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+    Export-HfSnapshot -DestinationRoot $tempRoot
+
+    Invoke-Git -WorkingDirectory $tempRoot -Arguments @("init", "-b", "main")
+
+    $gitUserName = (& git -C $sourceRoot config user.name).Trim()
+    $gitUserEmail = (& git -C $sourceRoot config user.email).Trim()
+    if ($gitUserName) {
+        Invoke-Git -WorkingDirectory $tempRoot -Arguments @("config", "user.name", $gitUserName)
+    }
+    if ($gitUserEmail) {
+        Invoke-Git -WorkingDirectory $tempRoot -Arguments @("config", "user.email", $gitUserEmail)
+    }
+
+    Invoke-Git -WorkingDirectory $tempRoot -Arguments @("add", ".")
+    Invoke-Git -WorkingDirectory $tempRoot -Arguments @("commit", "-m", "Deploy CLIProxyAPI to Hugging Face Spaces")
+    Invoke-Git -WorkingDirectory $tempRoot -Arguments @("remote", "add", "hf", $repoUrl)
+
+    Write-Host "`n正在推送 Hugging Face 快照..." -ForegroundColor Cyan
+    Invoke-Git -WorkingDirectory $tempRoot -Arguments @("push", "hf", "main:main", "--force")
+} finally {
+    if (Test-Path $tempRoot) {
+        Remove-Item $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
 Write-Host "`n部署完成!" -ForegroundColor Green
 Write-Host "Space 地址: https://huggingface.co/spaces/$HfUsername/$SpaceName" -ForegroundColor Cyan
