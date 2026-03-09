@@ -1,3 +1,12 @@
+---
+title: CLI Proxy API
+emoji: 🔌
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_port: 8317
+---
+
 # CLI Proxy API
 
 English | [中文](README_CN.md)
