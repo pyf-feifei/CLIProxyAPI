@@ -13,11 +13,14 @@ import (
 	"net/url"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
+	tls "github.com/refraction-networking/utls"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/proxy"
 )
 
 const (
@@ -86,14 +89,123 @@ type QwenAuth struct {
 	httpClient *http.Client
 }
 
-// NewQwenAuth creates a new QwenAuth instance with a proxy-configured HTTP client.
+// NewQwenAuth creates a new QwenAuth instance with a utls-based HTTP client
+// that uses Chrome's TLS fingerprint to bypass Alibaba Cloud WAF.
 func NewQwenAuth(cfg *config.Config) *QwenAuth {
-	if cfg == nil {
-		return &QwenAuth{httpClient: &http.Client{}}
+	var sdkCfg *config.SDKConfig
+	if cfg != nil {
+		sdkCfg = &cfg.SDKConfig
 	}
 	return &QwenAuth{
-		httpClient: util.SetProxy(&cfg.SDKConfig, &http.Client{}),
+		httpClient: newQwenHttpClient(sdkCfg),
 	}
+}
+
+// qwenUtlsRoundTripper uses utls with Chrome fingerprint to bypass
+// Alibaba Cloud WAF TLS fingerprinting on chat.qwen.ai.
+type qwenUtlsRoundTripper struct {
+	mu          sync.Mutex
+	connections map[string]*http2.ClientConn
+	pending     map[string]*sync.Cond
+	dialer      proxy.Dialer
+}
+
+func newQwenHttpClient(cfg *config.SDKConfig) *http.Client {
+	var dialer proxy.Dialer = proxy.Direct
+	if cfg != nil && cfg.ProxyURL != "" {
+		proxyURL, err := url.Parse(cfg.ProxyURL)
+		if err != nil {
+			log.Errorf("qwen: failed to parse proxy URL %q: %v", cfg.ProxyURL, err)
+		} else {
+			pDialer, err := proxy.FromURL(proxyURL, proxy.Direct)
+			if err != nil {
+				log.Errorf("qwen: failed to create proxy dialer for %q: %v", cfg.ProxyURL, err)
+			} else {
+				dialer = pDialer
+			}
+		}
+	}
+	return &http.Client{
+		Transport: &qwenUtlsRoundTripper{
+			connections: make(map[string]*http2.ClientConn),
+			pending:     make(map[string]*sync.Cond),
+			dialer:      dialer,
+		},
+	}
+}
+
+func (t *qwenUtlsRoundTripper) getOrCreateConn(host, addr string) (*http2.ClientConn, error) {
+	t.mu.Lock()
+	if h2, ok := t.connections[host]; ok && h2.CanTakeNewRequest() {
+		t.mu.Unlock()
+		return h2, nil
+	}
+	if cond, ok := t.pending[host]; ok {
+		cond.Wait()
+		if h2, ok := t.connections[host]; ok && h2.CanTakeNewRequest() {
+			t.mu.Unlock()
+			return h2, nil
+		}
+	}
+	cond := sync.NewCond(&t.mu)
+	t.pending[host] = cond
+	t.mu.Unlock()
+
+	conn, err := t.dialer.Dial("tcp", addr)
+	if err != nil {
+		t.mu.Lock()
+		delete(t.pending, host)
+		cond.Broadcast()
+		t.mu.Unlock()
+		return nil, err
+	}
+	tlsConn := tls.UClient(conn, &tls.Config{ServerName: host}, tls.HelloChrome_Auto)
+	if err = tlsConn.Handshake(); err != nil {
+		conn.Close()
+		t.mu.Lock()
+		delete(t.pending, host)
+		cond.Broadcast()
+		t.mu.Unlock()
+		return nil, err
+	}
+	h2, err := (&http2.Transport{}).NewClientConn(tlsConn)
+	if err != nil {
+		tlsConn.Close()
+		t.mu.Lock()
+		delete(t.pending, host)
+		cond.Broadcast()
+		t.mu.Unlock()
+		return nil, err
+	}
+
+	t.mu.Lock()
+	t.connections[host] = h2
+	delete(t.pending, host)
+	cond.Broadcast()
+	t.mu.Unlock()
+	return h2, nil
+}
+
+func (t *qwenUtlsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	host := req.URL.Hostname()
+	addr := req.URL.Host
+	if !strings.Contains(addr, ":") {
+		addr += ":443"
+	}
+	h2, err := t.getOrCreateConn(host, addr)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := h2.RoundTrip(req)
+	if err != nil {
+		t.mu.Lock()
+		if cached, ok := t.connections[host]; ok && cached == h2 {
+			delete(t.connections, host)
+		}
+		t.mu.Unlock()
+		return nil, err
+	}
+	return resp, nil
 }
 
 func qwenOAuthUserAgent() string {
