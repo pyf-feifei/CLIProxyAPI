@@ -5,11 +5,13 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"runtime"
 	"strings"
 	"time"
 
@@ -29,6 +31,8 @@ const (
 	QwenOAuthScope = "openid profile email model.completion"
 	// QwenOAuthGrantType specifies the grant type for the device code flow.
 	QwenOAuthGrantType = "urn:ietf:params:oauth:grant-type:device_code"
+	// QwenOAuthVersion tracks the upstream Qwen Code OAuth client version expected by Qwen's anti-bot rules.
+	QwenOAuthVersion = "0.12.0"
 )
 
 // QwenTokenData represents the OAuth credentials, including access and refresh tokens.
@@ -84,9 +88,77 @@ type QwenAuth struct {
 
 // NewQwenAuth creates a new QwenAuth instance with a proxy-configured HTTP client.
 func NewQwenAuth(cfg *config.Config) *QwenAuth {
+	if cfg == nil {
+		return &QwenAuth{httpClient: &http.Client{}}
+	}
 	return &QwenAuth{
 		httpClient: util.SetProxy(&cfg.SDKConfig, &http.Client{}),
 	}
+}
+
+func qwenOAuthUserAgent() string {
+	platform := runtime.GOOS
+	switch platform {
+	case "windows":
+		platform = "win32"
+	}
+
+	arch := runtime.GOARCH
+	switch arch {
+	case "amd64":
+		arch = "x64"
+	case "386":
+		arch = "x86"
+	}
+
+	return fmt.Sprintf("QwenCode/%s (%s; %s)", QwenOAuthVersion, platform, arch)
+}
+
+func generateRequestID() string {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+
+	// Format as a UUIDv4-compatible identifier.
+	buf[6] = (buf[6] & 0x0f) | 0x40
+	buf[8] = (buf[8] & 0x3f) | 0x80
+
+	return fmt.Sprintf(
+		"%s-%s-%s-%s-%s",
+		hex.EncodeToString(buf[0:4]),
+		hex.EncodeToString(buf[4:6]),
+		hex.EncodeToString(buf[6:8]),
+		hex.EncodeToString(buf[8:10]),
+		hex.EncodeToString(buf[10:16]),
+	)
+}
+
+func (qa *QwenAuth) client() *http.Client {
+	if qa != nil && qa.httpClient != nil {
+		return qa.httpClient
+	}
+	return &http.Client{}
+}
+
+func (qa *QwenAuth) newFormRequest(ctx context.Context, endpoint string, data url.Values, includeRequestID bool) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, err
+	}
+
+	userAgent := qwenOAuthUserAgent()
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+	req.Header.Set("Origin", "vscode-file://vscode-app")
+	req.Header.Set("Referer", "https://chat.qwen.ai/")
+	req.Header.Set("User-Agent", userAgent)
+	req.Header.Set("X-Dashscope-Useragent", userAgent)
+	if includeRequestID {
+		req.Header.Set("x-request-id", generateRequestID())
+	}
+	return req, nil
 }
 
 // generateCodeVerifier generates a cryptographically random string for the PKCE code verifier.
@@ -121,15 +193,12 @@ func (qa *QwenAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Qw
 	data.Set("refresh_token", refreshToken)
 	data.Set("client_id", QwenOAuthClientID)
 
-	req, err := http.NewRequestWithContext(ctx, "POST", QwenOAuthTokenEndpoint, strings.NewReader(data.Encode()))
+	req, err := qa.newFormRequest(ctx, QwenOAuthTokenEndpoint, data, false)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create token request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := qa.httpClient.Do(req)
+	resp, err := qa.client().Do(req)
 
 	// resp, err := qa.httpClient.PostForm(QwenOAuthTokenEndpoint, data)
 	if err != nil {
@@ -180,15 +249,12 @@ func (qa *QwenAuth) InitiateDeviceFlow(ctx context.Context) (*DeviceFlow, error)
 	data.Set("code_challenge", codeChallenge)
 	data.Set("code_challenge_method", "S256")
 
-	req, err := http.NewRequestWithContext(ctx, "POST", QwenOAuthDeviceCodeEndpoint, strings.NewReader(data.Encode()))
+	req, err := qa.newFormRequest(ctx, QwenOAuthDeviceCodeEndpoint, data, true)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create token request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := qa.httpClient.Do(req)
+	resp, err := qa.client().Do(req)
 
 	// resp, err := qa.httpClient.PostForm(QwenOAuthDeviceCodeEndpoint, data)
 	if err != nil {
@@ -235,7 +301,12 @@ func (qa *QwenAuth) PollForToken(deviceCode, codeVerifier string) (*QwenTokenDat
 		data.Set("device_code", deviceCode)
 		data.Set("code_verifier", codeVerifier)
 
-		resp, err := http.PostForm(QwenOAuthTokenEndpoint, data)
+		req, err := qa.newFormRequest(context.Background(), QwenOAuthTokenEndpoint, data, false)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create token polling request: %w", err)
+		}
+
+		resp, err := qa.client().Do(req)
 		if err != nil {
 			fmt.Printf("Polling attempt %d/%d failed: %v\n", attempt+1, maxAttempts, err)
 			time.Sleep(pollInterval)

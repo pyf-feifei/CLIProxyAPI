@@ -1723,7 +1723,10 @@ func (h *Handler) RequestQwenToken(c *gin.Context) {
 	deviceFlow, err := qwenAuth.InitiateDeviceFlow(ctx)
 	if err != nil {
 		log.Errorf("Failed to generate authorization URL: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "failed to generate authorization url",
+			"message": err.Error(),
+		})
 		return
 	}
 	authURL := deviceFlow.VerificationURIComplete
