@@ -53,6 +53,7 @@ func requireNotContains(t *testing.T, label, content string, subs ...string) {
 
 func TestHFDeployProfileGuard(t *testing.T) {
 	deployScript := readRepoFile(t, "deploy-hf.ps1")
+	gitAttributes := readRepoFile(t, ".gitattributes")
 	overlayDockerfile := readRepoFile(t, "deploy", "hf-profile", "Dockerfile")
 	overlayStartScript := readRepoFile(t, "deploy", "hf-profile", "start.sh")
 	qwenAuth := readRepoFile(t, "internal", "auth", "qwen", "qwen_auth.go")
@@ -65,12 +66,14 @@ func TestHFDeployProfileGuard(t *testing.T) {
 		"hf-profile",
 		"xray-config.json",
 	)
+	requireContains(t, ".gitattributes", gitAttributes, "*.sh text eol=lf")
 
 	requireContains(
 		t,
 		"deploy/hf-profile/Dockerfile",
 		overlayDockerfile,
 		"mihomo",
+		"curl",
 		`socks5://127.0.0.1:10808`,
 	)
 	requireNotContains(
@@ -86,6 +89,11 @@ func TestHFDeployProfileGuard(t *testing.T) {
 		"deploy/hf-profile/start.sh",
 		overlayStartScript,
 		"CLASH_SUB_URL",
+		"fail_proxy_bootstrap",
+		"exit 1",
+		"--socks5-hostname 127.0.0.1:10808",
+		"chat.qwen.ai/api/v1/oauth2/device/code",
+		"grep '^ *- name:'",
 		`proxy-url: "socks5://127.0.0.1:10808"`,
 		"DOMAIN,portal.qwen.ai,DIRECT",
 		"DOMAIN-SUFFIX,qwen.ai,auto",
@@ -95,6 +103,7 @@ func TestHFDeployProfileGuard(t *testing.T) {
 		"deploy/hf-profile/start.sh",
 		overlayStartScript,
 		"QWEN_AUTH_PROXY_URL",
+		"start_without_proxy",
 		"xray run",
 	)
 

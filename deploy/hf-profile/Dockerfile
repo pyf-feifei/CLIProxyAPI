@@ -16,7 +16,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X 'main.Version=${VERSION
 
 FROM alpine:3.22.0
 
-RUN apk add --no-cache tzdata gzip
+RUN apk add --no-cache tzdata gzip curl
 
 # Download mihomo (Clash Meta) for linux amd64 and use it as the only HF Qwen OAuth proxy path.
 RUN set -ex && \
