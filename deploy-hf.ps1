@@ -12,6 +12,14 @@ param(
 $ErrorActionPreference = "Stop"
 $repoUrl = "https://huggingface.co/spaces/$HfUsername/$SpaceName"
 $sourceRoot = (Resolve-Path (Join-Path $PSScriptRoot ".")).Path
+$hfProfileRoot = Join-Path $sourceRoot "deploy\hf-profile"
+$hfOverlayFiles = @(
+    @{ Source = Join-Path $hfProfileRoot "Dockerfile"; Destination = "Dockerfile" },
+    @{ Source = Join-Path $hfProfileRoot "start.sh"; Destination = "start.sh" }
+)
+$hfDeleteFiles = @(
+    "xray-config.json"
+)
 
 function Invoke-Git {
     param(
@@ -60,6 +68,50 @@ function Export-HfSnapshot {
     }
 }
 
+function Assert-HfDeployGuard {
+    if (-not (Test-Path $hfProfileRoot -PathType Container)) {
+        throw "HF deploy profile directory not found: $hfProfileRoot"
+    }
+
+    foreach ($overlay in $hfOverlayFiles) {
+        if (-not (Test-Path $overlay.Source -PathType Leaf)) {
+            throw "HF deploy overlay file not found: $($overlay.Source)"
+        }
+    }
+
+    Write-Host "运行 HF 部署保护测试..." -ForegroundColor Cyan
+    & go test ./test -run TestHFDeployProfileGuard
+    if ($LASTEXITCODE -ne 0) {
+        throw "HF deploy guard test failed"
+    }
+}
+
+function Copy-HfOverlay {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$DestinationRoot
+    )
+
+    Write-Host "应用 HF 覆盖层..." -ForegroundColor Cyan
+
+    foreach ($overlay in $hfOverlayFiles) {
+        $targetPath = Join-Path $DestinationRoot $overlay.Destination
+        $targetDir = Split-Path $targetPath -Parent
+        if ($targetDir -and -not (Test-Path $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        }
+
+        Copy-Item $overlay.Source $targetPath -Force
+    }
+
+    foreach ($relativePath in $hfDeleteFiles) {
+        $targetPath = Join-Path $DestinationRoot $relativePath
+        if (Test-Path $targetPath) {
+            Remove-Item $targetPath -Force
+        }
+    }
+}
+
 Write-Host "=== CLIProxyAPI Hugging Face Spaces 部署 ===" -ForegroundColor Cyan
 Write-Host "目标: $repoUrl" -ForegroundColor Gray
 
@@ -79,8 +131,11 @@ Write-Host "源目录: $sourceRoot" -ForegroundColor Gray
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("CLIProxyAPI-hf-" + [Guid]::NewGuid().ToString("N"))
 
 try {
+    Assert-HfDeployGuard
+
     New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
     Export-HfSnapshot -DestinationRoot $tempRoot
+    Copy-HfOverlay -DestinationRoot $tempRoot
 
     Invoke-Git -WorkingDirectory $tempRoot -Arguments @("init", "-b", "main")
 

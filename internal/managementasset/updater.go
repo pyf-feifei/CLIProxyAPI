@@ -468,6 +468,15 @@ func PatchManagementHTML(data []byte) []byte {
 	injection := managementSessionPatchMarker + managementSessionPatchScript
 	lowerContent := strings.ToLower(content)
 
+	if headIdx := strings.Index(lowerContent, "<head"); headIdx >= 0 {
+		if tagEnd := strings.Index(lowerContent[headIdx:], ">"); tagEnd >= 0 {
+			insertAt := headIdx + tagEnd + 1
+			return []byte(content[:insertAt] + injection + content[insertAt:])
+		}
+	}
+	if idx := strings.Index(lowerContent, "<script"); idx >= 0 {
+		return []byte(content[:idx] + injection + content[idx:])
+	}
 	if idx := strings.Index(lowerContent, "</head>"); idx >= 0 {
 		return []byte(content[:idx] + injection + content[idx:])
 	}

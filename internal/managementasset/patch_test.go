@@ -24,6 +24,22 @@ func TestPatchManagementHTML_InsertsBeforeHead(t *testing.T) {
 	}
 }
 
+func TestPatchManagementHTML_InsertsBeforeFirstScriptInHead(t *testing.T) {
+	input := []byte("<html><head><script>window.appBooted=true;</script><title>test</title></head><body></body></html>")
+
+	got := string(PatchManagementHTML(input))
+
+	if !strings.Contains(got, managementSessionPatchMarker) {
+		t.Fatalf("expected injected marker in patched html")
+	}
+
+	scriptIdx := strings.Index(strings.ToLower(got), "<script>")
+	markerIdx := strings.Index(got, managementSessionPatchMarker)
+	if markerIdx < 0 || scriptIdx < 0 || markerIdx > scriptIdx {
+		t.Fatalf("expected patch marker before first <script>: marker=%d script=%d", markerIdx, scriptIdx)
+	}
+}
+
 func TestPatchManagementHTML_IsIdempotent(t *testing.T) {
 	input := []byte("<html><head></head><body></body></html>")
 
