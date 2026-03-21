@@ -40,6 +40,16 @@ func TestPatchManagementHTML_InsertsBeforeFirstScriptInHead(t *testing.T) {
 	}
 }
 
+func TestPatchManagementHTML_IncludesRouteFlashGuardScript(t *testing.T) {
+	input := []byte("<html><head></head><body><div id='root'></div></body></html>")
+
+	got := string(PatchManagementHTML(input))
+
+	if !strings.Contains(got, "__cliproxyRouteFlashGuardV1") {
+		t.Fatalf("expected route flash guard script in patched html")
+	}
+}
+
 func TestPatchManagementHTML_IsIdempotent(t *testing.T) {
 	input := []byte("<html><head></head><body></body></html>")
 
