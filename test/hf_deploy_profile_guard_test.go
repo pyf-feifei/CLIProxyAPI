@@ -91,6 +91,7 @@ func TestHFDeployProfileGuard(t *testing.T) {
 		"CLASH_SUB_URL",
 		"fail_proxy_bootstrap",
 		"exit 1",
+		"Clash.Meta",
 		"--socks5-hostname 127.0.0.1:10808",
 		"chat.qwen.ai/api/v1/oauth2/device/code",
 		"grep '^ *- name:'",

@@ -13,6 +13,7 @@ QWEN_PROXY_URL="socks5://127.0.0.1:10808"
 QWEN_PROXY_PROBE_URL="https://chat.qwen.ai/api/v1/oauth2/device/code"
 QWEN_PROXY_PROBE_BODY="client_id=f0304373b74a44d2b584a3fb70ca9e56&scope=openid%20profile%20email%20model.completion&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256"
 QWEN_USER_AGENT="QwenCode/0.12.0 (linux; x64)"
+SUBSCRIPTION_USER_AGENT="Clash.Meta"
 
 fail_proxy_bootstrap() {
     echo "FATAL: $1" >&2
@@ -27,7 +28,11 @@ require_proxy_url_configured() {
 
 download_subscription() {
     echo "Downloading Clash subscription..."
-    if ! wget -q -T 30 -O "$CLASH_SUB_FILE" "$CLASH_SUB_URL"; then
+    if ! curl --fail --silent --show-error --location --connect-timeout 30 --max-time 60 \
+        --user-agent "$SUBSCRIPTION_USER_AGENT" \
+        -H 'Accept: application/x-yaml,text/yaml,application/octet-stream,*/*' \
+        -o "$CLASH_SUB_FILE" \
+        "$CLASH_SUB_URL"; then
         fail_proxy_bootstrap "failed to download subscription"
     fi
     if [ ! -s "$CLASH_SUB_FILE" ]; then
