@@ -51,11 +51,23 @@ func TestPatchManagementHTML_IncludesRouteFlashGuardScript(t *testing.T) {
 }
 
 func TestManagementSessionPatchScript_HydratesPersistedAuthState(t *testing.T) {
-	if !strings.Contains(managementSessionPatchScriptV2, "key === 'cli-proxy-auth'") {
+	if !strings.Contains(managementSessionPatchScript, "key === 'cli-proxy-auth'") {
 		t.Fatalf("expected session patch to intercept cli-proxy-auth reads")
 	}
-	if !strings.Contains(managementSessionPatchScriptV2, "parsed.state.isAuthenticated = true") {
+	if !strings.Contains(managementSessionPatchScript, "parsed.state.isAuthenticated = true") {
 		t.Fatalf("expected session patch to restore persisted authenticated state")
+	}
+}
+
+func TestManagementSessionPatchScript_DefaultsToSessionOnlyUntilRememberPasswordIsEnabled(t *testing.T) {
+	if !strings.Contains(managementSessionPatchScript, "writeSession(apiBase, match[1], current ? current.sessionOnly : true);") {
+		t.Fatalf("expected new sessions to default to session-only mode")
+	}
+	if !strings.Contains(managementSessionPatchScript, "return parsed.state.rememberPassword === true;") {
+		t.Fatalf("expected persistent mode to require rememberPassword=true")
+	}
+	if strings.Contains(managementSessionPatchScript, "typeof parsed.state.managementKey === 'string'") {
+		t.Fatalf("expected managementKey presence alone to no longer disable session-only mode")
 	}
 }
 
