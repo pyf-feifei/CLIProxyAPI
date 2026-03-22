@@ -38,6 +38,409 @@ const managementSessionPatchScript = `<script>(function(){if(window.__cliproxySe
 
 const managementRouteFlashGuardScript = `<script>(function(){if(window.__cliproxyRouteFlashGuardV1){return;}window.__cliproxyRouteFlashGuardV1=true;var SESSION_KEY='cli-proxy-session-auth';var currentHash=window.location.hash||'';if(!currentHash||currentHash.indexOf('#/login')===0){return;}var hasSession=false;try{hasSession=!!window.sessionStorage.getItem(SESSION_KEY);}catch(_err){hasSession=false;}if(!hasSession){return;}var STYLE_ID='cliproxy-refresh-guard-style';function ensureStyle(){if(document.getElementById(STYLE_ID)){return;}var style=document.createElement('style');style.id=STYLE_ID;style.textContent='html[data-cliproxy-refresh-guard=\"on\"] #root{visibility:hidden !important;}';document.head.appendChild(style);}function clearGuard(){document.documentElement.removeAttribute('data-cliproxy-refresh-guard');window.removeEventListener('hashchange',onHashChange,true);if(interval){window.clearInterval(interval);interval=null;}}function isLoginHash(){return(window.location.hash||'').indexOf('#/login')===0;}function onHashChange(){if(!isLoginHash()){clearGuard();}}ensureStyle();document.documentElement.setAttribute('data-cliproxy-refresh-guard','on');window.addEventListener('hashchange',onHashChange,true);var interval=window.setInterval(function(){if(!isLoginHash()){clearGuard();}},100);window.setTimeout(clearGuard,4000);window.addEventListener('pageshow',function(){if(!isLoginHash()){clearGuard();}},{once:true});})();</script>`
 
+const managementSessionPatchScriptV2 = `<script>
+(function () {
+  if (window.__cliproxySessionPatchV1) {
+    return;
+  }
+  window.__cliproxySessionPatchV1 = true;
+
+  var SESSION_KEY = 'cli-proxy-session-auth';
+  var ENC_PREFIX = 'enc::v1::';
+  var SECRET_SALT = 'cli-proxy-api-webui::secure-storage';
+  var recentLoginCaptureAt = 0;
+  var recentUserInteractionAt = 0;
+
+  function encodeText(text) {
+    return new TextEncoder().encode(text);
+  }
+
+  function decodeText(bytes) {
+    return new TextDecoder().decode(bytes);
+  }
+
+  function getKeyBytes() {
+    try {
+      return encodeText(SECRET_SALT + '|' + window.location.host + '|' + navigator.userAgent);
+    } catch (_err) {
+      return encodeText(SECRET_SALT);
+    }
+  }
+
+  function xorBytes(data, keyBytes) {
+    var result = new Uint8Array(data.length);
+    for (var i = 0; i < data.length; i++) {
+      result[i] = data[i] ^ keyBytes[i % keyBytes.length];
+    }
+    return result;
+  }
+
+  function toBase64(bytes) {
+    var binary = '';
+    for (var i = 0; i < bytes.length; i++) {
+      binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+  }
+
+  function fromBase64(base64) {
+    var binary = atob(base64);
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
+  }
+
+  function encryptData(value) {
+    if (!value) {
+      return value;
+    }
+    try {
+      return ENC_PREFIX + toBase64(xorBytes(encodeText(value), getKeyBytes()));
+    } catch (_err) {
+      return value;
+    }
+  }
+
+  function decryptData(payload) {
+    if (!payload || payload.indexOf(ENC_PREFIX) !== 0) {
+      return payload;
+    }
+    try {
+      return decodeText(xorBytes(fromBase64(payload.slice(ENC_PREFIX.length)), getKeyBytes()));
+    } catch (_err) {
+      return payload;
+    }
+  }
+
+  function encodeStoredValue(value) {
+    return encryptData(JSON.stringify(value));
+  }
+
+  function decodeStoredValue(raw) {
+    var payload = raw;
+    if (payload && payload.indexOf(ENC_PREFIX) === 0) {
+      payload = decryptData(payload);
+    }
+    return JSON.parse(payload);
+  }
+
+  function readSession() {
+    try {
+      var raw = window.sessionStorage.getItem(SESSION_KEY);
+      if (!raw) {
+        return null;
+      }
+      var parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed.apiBase !== 'string' || typeof parsed.managementKey !== 'string') {
+        return null;
+      }
+      return {
+        apiBase: parsed.apiBase,
+        managementKey: parsed.managementKey,
+        sessionOnly: parsed.sessionOnly === true,
+        updatedAt: Number(parsed.updatedAt || 0)
+      };
+    } catch (_err) {
+      return null;
+    }
+  }
+
+  function writeSession(apiBase, managementKey, sessionOnly) {
+    apiBase = String(apiBase || '').trim();
+    managementKey = String(managementKey || '').trim();
+    if (!apiBase || !managementKey) {
+      return;
+    }
+    try {
+      window.sessionStorage.setItem(SESSION_KEY, JSON.stringify({
+        apiBase: apiBase,
+        managementKey: managementKey,
+        sessionOnly: sessionOnly === true,
+        updatedAt: Date.now()
+      }));
+    } catch (_err) {}
+  }
+
+  function updateSessionMode(sessionOnly) {
+    var current = readSession();
+    if (!current) {
+      return;
+    }
+    writeSession(current.apiBase, current.managementKey, sessionOnly);
+  }
+
+  function clearSession() {
+    try {
+      window.sessionStorage.removeItem(SESSION_KEY);
+    } catch (_err) {}
+  }
+
+  function normalizeApiBase(requestUrl) {
+    try {
+      var parsedUrl = new URL(requestUrl, window.location.href);
+      var marker = '/v0/management';
+      var lowerPath = parsedUrl.pathname.toLowerCase();
+      var idx = lowerPath.indexOf(marker);
+      var basePath = idx >= 0 ? parsedUrl.pathname.slice(0, idx) : parsedUrl.pathname;
+      basePath = basePath.replace(/\/+$/, '');
+      return parsedUrl.origin + basePath;
+    } catch (_err) {
+      return '';
+    }
+  }
+
+  function isManagementURL(requestUrl) {
+    return String(requestUrl || '').toLowerCase().indexOf('/v0/management') >= 0;
+  }
+
+  function looksLikeManualLogin() {
+    return (window.location.hash || '').indexOf('#/login') === 0 && (Date.now() - recentUserInteractionAt) < 5000;
+  }
+
+  function sanitizePersistedAuth(raw) {
+    try {
+      var parsed = decodeStoredValue(raw);
+      if (!parsed || typeof parsed !== 'object' || !parsed.state || typeof parsed.state !== 'object') {
+        return raw;
+      }
+      parsed.state.rememberPassword = false;
+      delete parsed.state.managementKey;
+      return encodeStoredValue(parsed);
+    } catch (_err) {
+      return raw;
+    }
+  }
+
+  function payloadPersistsManagementKey(raw) {
+    try {
+      var parsed = decodeStoredValue(raw);
+      if (!parsed || typeof parsed !== 'object' || !parsed.state || typeof parsed.state !== 'object') {
+        return false;
+      }
+      return parsed.state.rememberPassword === true || (typeof parsed.state.managementKey === 'string' && parsed.state.managementKey.length > 0);
+    } catch (_err) {
+      return false;
+    }
+  }
+
+  function hydratePersistedAuth(raw, session) {
+    var parsed = null;
+
+    if (raw) {
+      try {
+        parsed = decodeStoredValue(raw);
+      } catch (_err) {
+        parsed = null;
+      }
+    }
+
+    if (!parsed || typeof parsed !== 'object') {
+      parsed = { state: {}, version: 0 };
+    }
+    if (!parsed.state || typeof parsed.state !== 'object') {
+      parsed.state = {};
+    }
+    if (typeof parsed.version === 'undefined') {
+      parsed.version = 0;
+    }
+
+    parsed.state.apiBase = session.apiBase;
+    parsed.state.apiUrl = session.apiBase;
+    parsed.state.managementKey = session.managementKey;
+    parsed.state.rememberPassword = false;
+    parsed.state.isAuthenticated = true;
+
+    return encodeStoredValue(parsed);
+  }
+
+  function captureSession(requestUrl, authorization) {
+    if (!isManagementURL(requestUrl)) {
+      return;
+    }
+
+    var match = String(authorization || '').match(/^\s*Bearer\s+(.+?)\s*$/i);
+    if (!match || !match[1]) {
+      return;
+    }
+
+    var apiBase = normalizeApiBase(requestUrl);
+    if (!apiBase) {
+      return;
+    }
+
+    var current = readSession();
+    writeSession(apiBase, match[1], current ? current.sessionOnly : false);
+
+    if ((window.location.hash || '').indexOf('#/login') === 0) {
+      recentLoginCaptureAt = Date.now();
+    }
+  }
+
+  function markInteraction() {
+    recentUserInteractionAt = Date.now();
+  }
+
+  window.addEventListener('pointerdown', markInteraction, true);
+  window.addEventListener('keydown', markInteraction, true);
+  window.addEventListener('submit', markInteraction, true);
+
+  var originalGetItem = Storage.prototype.getItem;
+  var originalSetItem = Storage.prototype.setItem;
+  var originalRemoveItem = Storage.prototype.removeItem;
+
+  Storage.prototype.getItem = function (key) {
+    if (this === window.localStorage) {
+      var session = readSession();
+      if (session && session.sessionOnly) {
+        if (key === 'cli-proxy-auth') {
+          return hydratePersistedAuth(originalGetItem.call(this, key), session);
+        }
+        if (key === 'isLoggedIn') {
+          return 'true';
+        }
+        if (key === 'apiBase' || key === 'apiUrl') {
+          return encodeStoredValue(session.apiBase);
+        }
+        if (key === 'managementKey') {
+          return encodeStoredValue(session.managementKey);
+        }
+      }
+    }
+
+    return originalGetItem.call(this, key);
+  };
+
+  Storage.prototype.setItem = function (key, value) {
+    if (this === window.localStorage) {
+      var session = readSession();
+
+      if (key === 'cli-proxy-auth' && session && session.sessionOnly) {
+        if (looksLikeManualLogin() && payloadPersistsManagementKey(String(value))) {
+          updateSessionMode(false);
+          return originalSetItem.call(this, key, value);
+        }
+        return originalSetItem.call(this, key, sanitizePersistedAuth(String(value)));
+      }
+
+      if (key === 'isLoggedIn' && value === 'true') {
+        if (session && session.sessionOnly) {
+          if (looksLikeManualLogin()) {
+            updateSessionMode(false);
+            return originalSetItem.call(this, key, value);
+          }
+          return;
+        }
+        if (session) {
+          updateSessionMode(false);
+        }
+      }
+    }
+
+    return originalSetItem.call(this, key, value);
+  };
+
+  Storage.prototype.removeItem = function (key) {
+    if (this === window.localStorage && key === 'isLoggedIn') {
+      var looksLikeFreshSessionOnlyLogin =
+        (window.location.hash || '').indexOf('#/login') === 0 &&
+        (Date.now() - recentLoginCaptureAt) < 3000;
+      if (looksLikeFreshSessionOnlyLogin) {
+        updateSessionMode(true);
+      } else {
+        clearSession();
+      }
+    }
+
+    return originalRemoveItem.call(this, key);
+  };
+
+  window.addEventListener('unauthorized', clearSession);
+
+  if (window.XMLHttpRequest) {
+    var originalOpen = XMLHttpRequest.prototype.open;
+    var originalSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+    var originalSend = XMLHttpRequest.prototype.send;
+
+    XMLHttpRequest.prototype.open = function (method, url) {
+      this.__cliproxyPatchUrl = url;
+      this.__cliproxyPatchAuth = '';
+      return originalOpen.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+      if (String(name || '').toLowerCase() === 'authorization') {
+        this.__cliproxyPatchAuth = String(value || '');
+      }
+      return originalSetRequestHeader.apply(this, arguments);
+    };
+
+    XMLHttpRequest.prototype.send = function () {
+      var xhr = this;
+      xhr.addEventListener('loadend', function onLoadEnd() {
+        if (xhr.status === 401) {
+          clearSession();
+          return;
+        }
+        if (xhr.status >= 200 && xhr.status < 400) {
+          captureSession(xhr.__cliproxyPatchUrl, xhr.__cliproxyPatchAuth);
+        }
+      }, { once: true });
+      return originalSend.apply(this, arguments);
+    };
+  }
+
+  if (window.fetch) {
+    var originalFetch = window.fetch;
+    window.fetch = function (input, init) {
+      var requestUrl = typeof input === 'string' ? input : (input && typeof input.url === 'string' ? input.url : '');
+      var authorization = '';
+
+      if (init && init.headers) {
+        if (typeof Headers !== 'undefined' && init.headers instanceof Headers) {
+          authorization = init.headers.get('Authorization') || '';
+        } else if (Array.isArray(init.headers)) {
+          for (var i = 0; i < init.headers.length; i++) {
+            var entry = init.headers[i];
+            if (Array.isArray(entry) && String(entry[0] || '').toLowerCase() === 'authorization') {
+              authorization = String(entry[1] || '');
+              break;
+            }
+          }
+        } else if (typeof init.headers === 'object') {
+          for (var headerName in init.headers) {
+            if (Object.prototype.hasOwnProperty.call(init.headers, headerName) && String(headerName).toLowerCase() === 'authorization') {
+              authorization = String(init.headers[headerName] || '');
+              break;
+            }
+          }
+        }
+      }
+
+      if (!authorization && input && typeof input === 'object' && typeof input.headers !== 'undefined') {
+        try {
+          if (typeof Headers !== 'undefined' && input.headers instanceof Headers) {
+            authorization = input.headers.get('Authorization') || '';
+          } else if (input.headers && typeof input.headers.get === 'function') {
+            authorization = input.headers.get('Authorization') || '';
+          }
+        } catch (_err) {}
+      }
+
+      return originalFetch.apply(this, arguments).then(function (response) {
+        if (response && response.status === 401) {
+          clearSession();
+        } else {
+          captureSession(requestUrl, authorization);
+        }
+        return response;
+      });
+    };
+  }
+})();
+</script>`
+
 // ManagementFileName exposes the control panel asset filename.
 const ManagementFileName = managementAssetName
 
@@ -467,7 +870,7 @@ func PatchManagementHTML(data []byte) []byte {
 		return data
 	}
 
-	injection := managementSessionPatchMarker + managementSessionPatchScript + managementRouteFlashGuardScript
+	injection := managementSessionPatchMarker + managementSessionPatchScriptV2 + managementRouteFlashGuardScript
 	lowerContent := strings.ToLower(content)
 
 	if headIdx := strings.Index(lowerContent, "<head"); headIdx >= 0 {

@@ -50,6 +50,15 @@ func TestPatchManagementHTML_IncludesRouteFlashGuardScript(t *testing.T) {
 	}
 }
 
+func TestManagementSessionPatchScript_HydratesPersistedAuthState(t *testing.T) {
+	if !strings.Contains(managementSessionPatchScriptV2, "key === 'cli-proxy-auth'") {
+		t.Fatalf("expected session patch to intercept cli-proxy-auth reads")
+	}
+	if !strings.Contains(managementSessionPatchScriptV2, "parsed.state.isAuthenticated = true") {
+		t.Fatalf("expected session patch to restore persisted authenticated state")
+	}
+}
+
 func TestPatchManagementHTML_IsIdempotent(t *testing.T) {
 	input := []byte("<html><head></head><body></body></html>")
 
