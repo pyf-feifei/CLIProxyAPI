@@ -54,8 +54,14 @@ func TestManagementSessionPatchScript_HydratesPersistedAuthState(t *testing.T) {
 	if !strings.Contains(managementSessionPatchScript, "key === 'cli-proxy-auth'") {
 		t.Fatalf("expected session patch to intercept cli-proxy-auth reads")
 	}
-	if !strings.Contains(managementSessionPatchScript, "parsed.state.isAuthenticated = true") {
-		t.Fatalf("expected session patch to restore persisted authenticated state")
+	if !strings.Contains(managementSessionPatchScript, "parsed.state.apiUrl = session.apiBase") {
+		t.Fatalf("expected session patch to restore the api base into persisted auth state")
+	}
+	if strings.Contains(managementSessionPatchScript, "parsed.state.isAuthenticated = true") {
+		t.Fatalf("expected session patch to stop faking authenticated state during refresh")
+	}
+	if strings.Contains(managementSessionPatchScript, "parsed.state.managementKey = session.managementKey") {
+		t.Fatalf("expected session patch to keep the management key out of persisted auth hydration")
 	}
 }
 

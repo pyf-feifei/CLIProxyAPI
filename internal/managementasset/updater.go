@@ -246,9 +246,7 @@ const managementSessionPatchScript = `<script>
 
     parsed.state.apiBase = session.apiBase;
     parsed.state.apiUrl = session.apiBase;
-    parsed.state.managementKey = session.managementKey;
     parsed.state.rememberPassword = false;
-    parsed.state.isAuthenticated = true;
 
     return encodeStoredValue(parsed);
   }
