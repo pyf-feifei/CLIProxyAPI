@@ -57,6 +57,7 @@ func TestHFDeployProfileGuard(t *testing.T) {
 	overlayDockerfile := readRepoFile(t, "deploy", "hf-profile", "Dockerfile")
 	overlayStartScript := readRepoFile(t, "deploy", "hf-profile", "start.sh")
 	qwenAuth := readRepoFile(t, "internal", "auth", "qwen", "qwen_auth.go")
+	managementPatch := readRepoFile(t, "internal", "managementasset", "updater.go")
 
 	requireContains(
 		t,
@@ -110,4 +111,22 @@ func TestHFDeployProfileGuard(t *testing.T) {
 
 	requireContains(t, "internal/auth/qwen/qwen_auth.go", qwenAuth, "cfg.ProxyURL")
 	requireNotContains(t, "internal/auth/qwen/qwen_auth.go", qwenAuth, "QWEN_AUTH_PROXY_URL")
+
+	requireContains(
+		t,
+		"internal/managementasset/updater.go",
+		managementPatch,
+		"__cliproxyRouteFlashGuardV1",
+		"writeSession(apiBase, match[1], current ? current.sessionOnly : true);",
+		"return parsed.state.rememberPassword === true;",
+		"parsed.state.apiUrl = session.apiBase;",
+	)
+	requireNotContains(
+		t,
+		"internal/managementasset/updater.go",
+		managementPatch,
+		"parsed.state.isAuthenticated = true;",
+		"parsed.state.managementKey = session.managementKey;",
+		"typeof parsed.state.managementKey === 'string'",
+	)
 }
