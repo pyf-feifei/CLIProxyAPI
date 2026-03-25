@@ -8,12 +8,13 @@ MIHOMO_CONFIG="$MIHOMO_WORKDIR/mihomo-config.yaml"
 CLASH_SUB_FILE="/tmp/clash-sub.yaml"
 PROXIES_BLOCK_FILE="/tmp/proxies-block.yaml"
 PROXY_NAMES_FILE="/tmp/proxy-names.txt"
-PROXY_LIST_FILE="/tmp/proxy-list.yaml"
 QWEN_PROXY_URL="socks5://127.0.0.1:10808"
 QWEN_PROXY_PROBE_URL="https://chat.qwen.ai/api/v1/oauth2/device/code"
 QWEN_PROXY_PROBE_BODY="client_id=f0304373b74a44d2b584a3fb70ca9e56&scope=openid%20profile%20email%20model.completion&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256"
 QWEN_USER_AGENT="QwenCode/0.12.0 (linux; x64)"
 SUBSCRIPTION_USER_AGENT="Clash.Meta"
+QWEN_SELECTED_PROXY=""
+MIHOMO_PID=""
 
 fail_proxy_bootstrap() {
     echo "FATAL: $1" >&2
@@ -59,10 +60,38 @@ found { print }
     fi
 }
 
+extract_inline_proxy_name() {
+    line="$1"
+    value=${line#*name:}
+    value=$(printf '%s' "$value" | sed 's/^[[:space:]]*//')
+
+    case "$value" in
+        \"*)
+            value=${value#\"}
+            value=${value%%\"*}
+            ;;
+        \'*)
+            value=${value#\'}
+            value=${value%%\'*}
+            ;;
+        *)
+            value=${value%%,*}
+            value=$(printf '%s' "$value" | sed 's/[[:space:]]*$//')
+            ;;
+    esac
+
+    printf '%s\n' "$value"
+}
+
 extract_proxy_names() {
     : > "$PROXY_NAMES_FILE"
 
-    grep '^ *- {name:' "$PROXIES_BLOCK_FILE" | sed 's/.*{name: *//;s/,.*//' >> "$PROXY_NAMES_FILE" || true
+    while IFS= read -r line; do
+        extract_inline_proxy_name "$line" >> "$PROXY_NAMES_FILE"
+    done <<EOF
+$(grep '^ *- {name:' "$PROXIES_BLOCK_FILE" || true)
+EOF
+
     grep '^ *- name:' "$PROXIES_BLOCK_FILE" | sed 's/^[[:space:]]*-[[:space:]]*name:[[:space:]]*//' >> "$PROXY_NAMES_FILE" || true
 
     if [ -s "$PROXY_NAMES_FILE" ]; then
@@ -80,20 +109,13 @@ extract_proxy_names() {
     fi
 }
 
-build_proxy_group_list() {
-    : > "$PROXY_LIST_FILE"
-    while IFS= read -r pname; do
-        pname=$(echo "$pname" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-        [ -z "$pname" ] && continue
-        echo "      - \"$pname\"" >> "$PROXY_LIST_FILE"
-    done < "$PROXY_NAMES_FILE"
-
-    if [ ! -s "$PROXY_LIST_FILE" ]; then
-        fail_proxy_bootstrap "proxy group list is empty after parsing subscription"
-    fi
+yaml_escape() {
+    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
 }
 
 write_mihomo_config() {
+    selected_proxy_name=$(yaml_escape "$1")
+
     {
         cat << 'HEADER'
 socks-port: 10808
@@ -109,32 +131,25 @@ HEADER
 
         cat "$PROXIES_BLOCK_FILE"
 
-        cat << 'MID'
+        cat <<MID
 
 proxy-groups:
-  - name: auto
-    type: url-test
+  - name: qwen
+    type: select
     proxies:
-MID
-
-        cat "$PROXY_LIST_FILE"
-
-        cat << 'TAIL'
-    url: http://www.gstatic.com/generate_204
-    interval: 300
-    tolerance: 150
+      - "$selected_proxy_name"
 
 rules:
   - DOMAIN,portal.qwen.ai,DIRECT
-  - DOMAIN-SUFFIX,qwen.ai,auto
+  - DOMAIN-SUFFIX,qwen.ai,qwen
   - MATCH,DIRECT
-TAIL
+MID
     } > "$MIHOMO_CONFIG"
 
     echo "=== Generated mihomo config (first 30 lines) ==="
     sed -n '1,30p' "$MIHOMO_CONFIG"
-    echo "=== Proxy group proxies (first 5) ==="
-    grep -A5 'type: url-test' "$MIHOMO_CONFIG" || true
+    echo "=== Qwen proxy group ==="
+    grep -A5 'type: select' "$MIHOMO_CONFIG" || true
     echo "==="
 }
 
@@ -146,8 +161,16 @@ validate_mihomo_config() {
     fi
 }
 
+stop_mihomo() {
+    if [ -n "$MIHOMO_PID" ] && kill -0 "$MIHOMO_PID" 2>/dev/null; then
+        kill "$MIHOMO_PID" 2>/dev/null || true
+        wait "$MIHOMO_PID" 2>/dev/null || true
+    fi
+    MIHOMO_PID=""
+}
+
 start_mihomo() {
-    echo "Starting mihomo proxy (auto-select best node)..."
+    echo "Starting mihomo proxy..."
     mihomo -d "$MIHOMO_WORKDIR" -f "$MIHOMO_CONFIG" >/tmp/mihomo.log 2>&1 &
     MIHOMO_PID=$!
 
@@ -155,6 +178,7 @@ start_mihomo() {
 
     if ! kill -0 "$MIHOMO_PID" 2>/dev/null; then
         cat /tmp/mihomo.log >&2 || true
+        MIHOMO_PID=""
         fail_proxy_bootstrap "mihomo failed to start"
     fi
 
@@ -162,8 +186,7 @@ start_mihomo() {
 }
 
 probe_qwen_proxy() {
-    echo "Probing Qwen OAuth endpoint through mihomo..."
-    HTTP_CODE="$(
+    HTTP_CODE="$({
         curl --silent --show-error --output /tmp/qwen-proxy-check.out --write-out '%{http_code}' --max-time 20 \
             --socks5-hostname 127.0.0.1:10808 \
             -X POST "$QWEN_PROXY_PROBE_URL" \
@@ -175,22 +198,55 @@ probe_qwen_proxy() {
             -H "User-Agent: $QWEN_USER_AGENT" \
             -H "X-Dashscope-Useragent: $QWEN_USER_AGENT" \
             -H 'x-request-id: hf-proxy-probe' \
-            --data "$QWEN_PROXY_PROBE_BODY" || printf '000'
-    )"
+            --data "$QWEN_PROXY_PROBE_BODY"
+    } || printf '000')"
 
     case "$HTTP_CODE" in
         200)
             echo "Qwen OAuth probe succeeded"
+            return 0
             ;;
         400|401|403)
             echo "Qwen OAuth probe reached upstream (HTTP $HTTP_CODE)"
+            return 0
             ;;
         *)
             cat /tmp/qwen-proxy-check.out >&2 || true
-            kill "$MIHOMO_PID" 2>/dev/null || true
-            fail_proxy_bootstrap "Qwen OAuth probe failed through mihomo (HTTP $HTTP_CODE)"
+            echo "Qwen OAuth probe failed through mihomo (HTTP $HTTP_CODE)" >&2
+            return 1
             ;;
     esac
+}
+
+probe_qwen_proxy_for_candidate() {
+    candidate_name="$1"
+
+    echo "Probing Qwen OAuth with candidate proxy: $candidate_name"
+    write_mihomo_config "$candidate_name"
+    validate_mihomo_config
+    start_mihomo
+
+    if probe_qwen_proxy; then
+        QWEN_SELECTED_PROXY="$candidate_name"
+        return 0
+    fi
+
+    stop_mihomo
+    return 1
+}
+
+select_working_qwen_proxy() {
+    while IFS= read -r candidate_name; do
+        candidate_name=$(echo "$candidate_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$candidate_name" ] && continue
+
+        if probe_qwen_proxy_for_candidate "$candidate_name"; then
+            echo "Locked Qwen OAuth traffic to proxy node: $candidate_name"
+            return 0
+        fi
+    done < "$PROXY_NAMES_FILE"
+
+    fail_proxy_bootstrap "no working proxy node could reach Qwen OAuth"
 }
 
 if [ -z "$CLASH_SUB_URL" ]; then
@@ -201,10 +257,7 @@ require_proxy_url_configured
 download_subscription
 extract_proxies_block
 extract_proxy_names
-build_proxy_group_list
-write_mihomo_config
-validate_mihomo_config
-start_mihomo
-probe_qwen_proxy
+select_working_qwen_proxy
 
+echo "Qwen OAuth proxy selection complete: $QWEN_SELECTED_PROXY"
 exec ./server

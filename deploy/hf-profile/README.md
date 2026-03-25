@@ -16,3 +16,6 @@ Rules:
 - Do not add `QWEN_AUTH_PROXY_URL` back as a second HF-only runtime path.
 - HF startup must fail fast when `CLASH_SUB_URL`, mihomo config generation, or the Qwen proxy probe is broken.
 - HF startup must not silently clear `proxy-url` and continue serving a deployment that cannot complete Qwen OAuth.
+- HF startup must probe candidate nodes against the real Qwen OAuth endpoint before serving traffic.
+- HF startup must lock Qwen traffic to a verified node via a `select` group.
+- HF startup must not use `url-test`, `auto`, or gstatic probes for Qwen routing.
