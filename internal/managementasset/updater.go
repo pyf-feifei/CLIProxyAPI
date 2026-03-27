@@ -32,6 +32,7 @@ const (
 	managementSyncMinInterval    = 30 * time.Second
 	updateCheckInterval          = 3 * time.Hour
 	managementSessionPatchMarker = "<!-- cliproxyapi-session-refresh-patch -->"
+	maxAssetDownloadSize         = 50 << 20 // 10 MB safety limit for management asset downloads
 )
 
 const managementRouteFlashGuardScript = `<script>(function(){if(window.__cliproxyRouteFlashGuardV1){return;}window.__cliproxyRouteFlashGuardV1=true;var SESSION_KEY='cli-proxy-session-auth';var currentHash=window.location.hash||'';if(!currentHash||currentHash.indexOf('#/login')===0){return;}var hasSession=false;try{hasSession=!!window.sessionStorage.getItem(SESSION_KEY);}catch(_err){hasSession=false;}if(!hasSession){return;}var STYLE_ID='cliproxy-refresh-guard-style';function ensureStyle(){if(document.getElementById(STYLE_ID)){return;}var style=document.createElement('style');style.id=STYLE_ID;style.textContent='html[data-cliproxy-refresh-guard=\"on\"] #root{visibility:hidden !important;}';document.head.appendChild(style);}function clearGuard(){document.documentElement.removeAttribute('data-cliproxy-refresh-guard');window.removeEventListener('hashchange',onHashChange,true);if(interval){window.clearInterval(interval);interval=null;}}function isLoginHash(){return(window.location.hash||'').indexOf('#/login')===0;}function onHashChange(){if(!isLoginHash()){clearGuard();}}ensureStyle();document.documentElement.setAttribute('data-cliproxy-refresh-guard','on');window.addEventListener('hashchange',onHashChange,true);var interval=window.setInterval(function(){if(!isLoginHash()){clearGuard();}},100);window.setTimeout(clearGuard,4000);window.addEventListener('pageshow',function(){if(!isLoginHash()){clearGuard();}},{once:true});})();</script>`
@@ -488,6 +489,10 @@ func runAutoUpdater(ctx context.Context) {
 			log.Debug("management asset auto-updater skipped: control panel disabled")
 			return
 		}
+		if cfg.RemoteManagement.DisableAutoUpdatePanel {
+			log.Debug("management asset auto-updater skipped: disable-auto-update-panel is enabled")
+			return
+		}
 
 		configPath, _ := schedulerConfigPath.Load().(string)
 		staticDir := StaticDir(configPath)
@@ -659,7 +664,8 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 		}
 
 		if remoteHash != "" && !strings.EqualFold(remoteHash, downloadedHash) {
-			log.Warnf("remote digest mismatch for management asset: expected %s got %s", remoteHash, downloadedHash)
+			log.Errorf("management asset digest mismatch: expected %s got %s — aborting update for safety", remoteHash, downloadedHash)
+			return nil, nil
 		}
 
 		if err = atomicWriteFile(localPath, data); err != nil {
@@ -681,6 +687,9 @@ func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, loca
 		log.WithError(err).Warn("failed to download fallback management control panel page")
 		return false
 	}
+
+	log.Warnf("management asset downloaded from fallback URL without digest verification (hash=%s) — "+
+		"enable verified GitHub updates by keeping disable-auto-update-panel set to false", downloadedHash)
 
 	if err = atomicWriteFile(localPath, data); err != nil {
 		log.WithError(err).Warn("failed to persist fallback management control panel page")
@@ -792,9 +801,12 @@ func downloadAsset(ctx context.Context, client *http.Client, downloadURL string)
 		return nil, "", fmt.Errorf("unexpected download status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	data, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxAssetDownloadSize+1))
 	if err != nil {
 		return nil, "", fmt.Errorf("read download body: %w", err)
+	}
+	if int64(len(data)) > maxAssetDownloadSize {
+		return nil, "", fmt.Errorf("download exceeds maximum allowed size of %d bytes", maxAssetDownloadSize)
 	}
 
 	sum := sha256.Sum256(data)
