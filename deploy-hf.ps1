@@ -112,32 +112,6 @@ function Copy-HfOverlay {
     }
 }
 
-function Invoke-HfPush {
-    param(
-        [Parameter(Mandatory=$true)]
-        [string]$WorkingDirectory,
-
-        [Parameter(Mandatory=$true)]
-        [string]$RemoteName,
-
-        [string]$RefSpec = "main:main"
-    )
-
-    $hfToken = [Environment]::GetEnvironmentVariable("HF_TOKEN")
-    if ($hfToken) {
-        & git -C $WorkingDirectory -c ("http.extraHeader=Authorization: Bearer " + $hfToken) push $RemoteName $RefSpec --force
-    } else {
-        & git -C $WorkingDirectory push $RemoteName $RefSpec --force
-    }
-
-    if ($LASTEXITCODE -ne 0) {
-        if ($hfToken) {
-            throw "git push to Hugging Face failed even with HF_TOKEN authentication"
-        }
-        throw "git push to Hugging Face failed; run hf auth login or set HF_TOKEN with write access"
-    }
-}
-
 Write-Host "=== CLIProxyAPI Hugging Face Spaces 部署 ===" -ForegroundColor Cyan
 Write-Host "目标: $repoUrl" -ForegroundColor Gray
 
@@ -176,10 +150,16 @@ try {
 
     Invoke-Git -WorkingDirectory $tempRoot -Arguments @("add", ".")
     Invoke-Git -WorkingDirectory $tempRoot -Arguments @("commit", "-m", "Deploy CLIProxyAPI to Hugging Face Spaces")
-    Invoke-Git -WorkingDirectory $tempRoot -Arguments @("remote", "add", "hf", $repoUrl)
+    $pushRepoUrl = $repoUrl
+    $hfToken = [Environment]::GetEnvironmentVariable("HF_TOKEN")
+    if ($hfToken) {
+        $pushRepoUrl = "https://${HfUsername}:$hfToken@huggingface.co/spaces/$HfUsername/$SpaceName"
+    }
+
+    Invoke-Git -WorkingDirectory $tempRoot -Arguments @("remote", "add", "hf", $pushRepoUrl)
 
     Write-Host "`n正在推送 Hugging Face 快照..." -ForegroundColor Cyan
-    Invoke-HfPush -WorkingDirectory $tempRoot -RemoteName "hf"
+    Invoke-Git -WorkingDirectory $tempRoot -Arguments @("push", "hf", "main:main", "--force")
 } finally {
     if (Test-Path $tempRoot) {
         Remove-Item $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
