@@ -77,6 +77,18 @@ func TestManagementSessionPatchScript_DefaultsToSessionOnlyUntilRememberPassword
 	}
 }
 
+func TestManagementSessionPatchScript_NormalizesManagementRequestURLs(t *testing.T) {
+	if !strings.Contains(managementSessionPatchScript, "function normalizeManagementRequestUrl(requestUrl)") {
+		t.Fatalf("expected request URL normalization helper in session patch")
+	}
+	if !strings.Contains(managementSessionPatchScript, "pathname = pathname.replace(/\\/management\\.html(?=\\/|$)/ig, '');") {
+		t.Fatalf("expected request URL normalization to strip /management.html from request paths")
+	}
+	if !strings.Contains(managementSessionPatchScript, "pathname = pathname.replace(/\\/v0\\/management\\/v0\\/management(?=\\/|$)/ig, '/v0/management');") {
+		t.Fatalf("expected request URL normalization to collapse duplicated management prefixes")
+	}
+}
+
 func TestPatchManagementHTML_IsIdempotent(t *testing.T) {
 	input := []byte("<html><head></head><body></body></html>")
 

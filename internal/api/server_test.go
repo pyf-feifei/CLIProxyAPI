@@ -13,6 +13,7 @@ import (
 	gin "github.com/gin-gonic/gin"
 	proxyconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	internallogging "github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
@@ -231,5 +232,32 @@ func TestDefaultRequestLoggerFactory_UsesResolvedLogDirectory(t *testing.T) {
 		if strings.HasPrefix(entry.Name(), "error-") && strings.HasSuffix(entry.Name(), ".log") {
 			t.Fatalf("unexpected forced error log in config dir %s", configLogsDir)
 		}
+	}
+}
+
+func TestServeManagementControlPanel_DisablesCaching(t *testing.T) {
+	server := newTestServer(t)
+
+	assetPath := filepath.Join(t.TempDir(), managementasset.ManagementFileName)
+	if err := os.WriteFile(assetPath, []byte("<html><head></head><body><div id='root'></div></body></html>"), 0o644); err != nil {
+		t.Fatalf("failed to write management asset: %v", err)
+	}
+	t.Setenv("MANAGEMENT_STATIC_PATH", assetPath)
+
+	req := httptest.NewRequest(http.MethodGet, "/management.html", nil)
+	rr := httptest.NewRecorder()
+	server.engine.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("unexpected status code: got %d want %d; body=%s", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if got := rr.Header().Get("Cache-Control"); !strings.Contains(got, "no-store") {
+		t.Fatalf("expected Cache-Control to disable caching, got %q", got)
+	}
+	if got := rr.Header().Get("Pragma"); got != "no-cache" {
+		t.Fatalf("expected Pragma=no-cache, got %q", got)
+	}
+	if got := rr.Header().Get("Expires"); got != "0" {
+		t.Fatalf("expected Expires=0, got %q", got)
 	}
 }

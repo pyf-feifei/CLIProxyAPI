@@ -20,6 +20,9 @@ $hfOverlayFiles = @(
 $hfDeleteFiles = @(
     "xray-config.json"
 )
+$hfExtraFiles = @(
+    "static/management.html"
+)
 
 function Invoke-Git {
     param(
@@ -53,6 +56,21 @@ function Export-HfSnapshot {
             continue
         }
 
+        $sourcePath = Join-Path $sourceRoot $relativePath
+        if (-not (Test-Path $sourcePath -PathType Leaf)) {
+            continue
+        }
+
+        $targetPath = Join-Path $DestinationRoot $relativePath
+        $targetDir = Split-Path $targetPath -Parent
+        if ($targetDir -and -not (Test-Path $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        }
+
+        Copy-Item $sourcePath $targetPath -Force
+    }
+
+    foreach ($relativePath in $hfExtraFiles) {
         $sourcePath = Join-Path $sourceRoot $relativePath
         if (-not (Test-Path $sourcePath -PathType Leaf)) {
             continue
@@ -149,6 +167,9 @@ try {
     }
 
     Invoke-Git -WorkingDirectory $tempRoot -Arguments @("add", ".")
+    if ($hfExtraFiles.Count -gt 0) {
+        Invoke-Git -WorkingDirectory $tempRoot -Arguments (@("add", "--force", "--") + $hfExtraFiles)
+    }
     Invoke-Git -WorkingDirectory $tempRoot -Arguments @("commit", "-m", "Deploy CLIProxyAPI to Hugging Face Spaces")
     $pushRepoUrl = $repoUrl
     $hfToken = [Environment]::GetEnvironmentVariable("HF_TOKEN")

@@ -135,8 +135,9 @@ const managementSessionPatchScript = `<script>
       if (!parsed || typeof parsed.apiBase !== 'string' || typeof parsed.managementKey !== 'string') {
         return null;
       }
+      var normalizedApiBase = normalizeApiBaseValue(parsed.apiBase);
       return {
-        apiBase: parsed.apiBase,
+        apiBase: normalizedApiBase || parsed.apiBase,
         managementKey: parsed.managementKey,
         sessionOnly: parsed.sessionOnly === true,
         updatedAt: Number(parsed.updatedAt || 0)
@@ -147,7 +148,7 @@ const managementSessionPatchScript = `<script>
   }
 
   function writeSession(apiBase, managementKey, sessionOnly) {
-    apiBase = String(apiBase || '').trim();
+    apiBase = normalizeApiBaseValue(apiBase);
     managementKey = String(managementKey || '').trim();
     if (!apiBase || !managementKey) {
       return;
@@ -176,17 +177,49 @@ const managementSessionPatchScript = `<script>
     } catch (_err) {}
   }
 
+  function normalizeManagementPath(pathname) {
+    pathname = String(pathname || '');
+    pathname = pathname.replace(/\/management\.html(?=\/|$)/ig, '');
+    pathname = pathname.replace(/\/v0\/management\/v0\/management(?=\/|$)/ig, '/v0/management');
+    pathname = pathname.replace(/\/{2,}/g, '/');
+    return pathname || '/';
+  }
+
+  function normalizeApiBaseValue(apiBase) {
+    apiBase = String(apiBase || '').trim();
+    if (!apiBase) {
+      return '';
+    }
+    try {
+      var parsedUrl = new URL(apiBase, window.location.href);
+      var marker = '/v0/management';
+      var pathname = normalizeManagementPath(parsedUrl.pathname);
+      var lowerPath = pathname.toLowerCase();
+      var idx = lowerPath.indexOf(marker);
+      if (idx >= 0) {
+        pathname = pathname.slice(0, idx);
+      }
+      pathname = pathname.replace(/\/+$/, '');
+      return parsedUrl.origin + pathname;
+    } catch (_err) {
+      return apiBase;
+    }
+  }
+
   function normalizeApiBase(requestUrl) {
+    return normalizeApiBaseValue(requestUrl);
+  }
+
+  function normalizeManagementRequestUrl(requestUrl) {
+    if (!requestUrl) {
+      return requestUrl;
+    }
     try {
       var parsedUrl = new URL(requestUrl, window.location.href);
-      var marker = '/v0/management';
-      var lowerPath = parsedUrl.pathname.toLowerCase();
-      var idx = lowerPath.indexOf(marker);
-      var basePath = idx >= 0 ? parsedUrl.pathname.slice(0, idx) : parsedUrl.pathname;
-      basePath = basePath.replace(/\/+$/, '');
-      return parsedUrl.origin + basePath;
+      parsedUrl.pathname = normalizeManagementPath(parsedUrl.pathname);
+      return parsedUrl.toString();
     } catch (_err) {
-      return '';
+      return requestUrl;
     }
   }
 
@@ -357,9 +390,14 @@ const managementSessionPatchScript = `<script>
     var originalSend = XMLHttpRequest.prototype.send;
 
     XMLHttpRequest.prototype.open = function (method, url) {
-      this.__cliproxyPatchUrl = url;
+      var normalizedUrl = normalizeManagementRequestUrl(url);
+      this.__cliproxyPatchUrl = normalizedUrl;
       this.__cliproxyPatchAuth = '';
-      return originalOpen.apply(this, arguments);
+      var args = Array.prototype.slice.call(arguments);
+      if (args.length >= 2) {
+        args[1] = normalizedUrl;
+      }
+      return originalOpen.apply(this, args);
     };
 
     XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
@@ -388,6 +426,7 @@ const managementSessionPatchScript = `<script>
     var originalFetch = window.fetch;
     window.fetch = function (input, init) {
       var requestUrl = typeof input === 'string' ? input : (input && typeof input.url === 'string' ? input.url : '');
+      var normalizedRequestUrl = normalizeManagementRequestUrl(requestUrl);
       var authorization = '';
 
       if (init && init.headers) {
@@ -421,7 +460,18 @@ const managementSessionPatchScript = `<script>
         } catch (_err) {}
       }
 
-      return originalFetch.apply(this, arguments).then(function (response) {
+      if (normalizedRequestUrl && normalizedRequestUrl !== requestUrl) {
+        if (typeof input === 'string') {
+          input = normalizedRequestUrl;
+        } else if (typeof Request !== 'undefined' && input instanceof Request) {
+          input = new Request(normalizedRequestUrl, input);
+        } else {
+          input = normalizedRequestUrl;
+        }
+        requestUrl = normalizedRequestUrl;
+      }
+
+      return originalFetch.call(this, input, init).then(function (response) {
         if (response && response.status === 401) {
           clearSession();
         } else {

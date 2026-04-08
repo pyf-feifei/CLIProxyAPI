@@ -33,8 +33,10 @@ RUN set -ex && \
 RUN mkdir /CLIProxyAPI
 
 COPY --from=builder ./app/server /CLIProxyAPI/server
+RUN mkdir -p /CLIProxyAPI/static
 
 COPY config.example.yaml /CLIProxyAPI/config.example.yaml
+COPY static/management.html /CLIProxyAPI/static/management.html
 
 # HF deploys use config.yaml as a single proxy source of truth for Qwen OAuth.
 RUN cp /CLIProxyAPI/config.example.yaml /CLIProxyAPI/config.yaml
@@ -49,6 +51,7 @@ EXPOSE 8317
 
 ENV TZ=Asia/Shanghai
 ENV DEPLOY=cloud
+ENV MANAGEMENT_STATIC_PATH=/CLIProxyAPI/static
 # Set CLASH_SUB_URL to a Clash subscription URL to enable the HF-only Qwen proxy bootstrap.
 # Leave it empty to disable the proxy and restore direct traffic in config.yaml before startup.
 

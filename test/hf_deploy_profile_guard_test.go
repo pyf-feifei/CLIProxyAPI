@@ -67,6 +67,8 @@ func TestHFDeployProfileGuard(t *testing.T) {
 		"deploy",
 		"hf-profile",
 		"xray-config.json",
+		"static/management.html",
+		"add\", \"--force\", \"--\"",
 	)
 	requireContains(t, ".gitattributes", gitAttributes, "*.sh text eol=lf")
 
@@ -77,6 +79,8 @@ func TestHFDeployProfileGuard(t *testing.T) {
 		"mihomo",
 		"curl",
 		`socks5://127.0.0.1:10808`,
+		"COPY static/management.html /CLIProxyAPI/static/management.html",
+		"MANAGEMENT_STATIC_PATH=/CLIProxyAPI/static",
 	)
 	requireNotContains(
 		t,
