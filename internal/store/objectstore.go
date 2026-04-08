@@ -597,6 +597,7 @@ func (s *ObjectTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Aut
 		NextRefreshAfter: time.Time{},
 	}
 	cliproxyauth.HydrateRuntimeStateFromMetadata(auth)
+	cliproxyauth.ApplyCustomHeadersFromMetadata(auth)
 	return auth, nil
 }
 
