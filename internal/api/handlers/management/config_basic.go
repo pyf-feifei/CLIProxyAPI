@@ -168,6 +168,16 @@ func (h *Handler) GetConfigYAML(c *gin.Context) {
 	data, err := os.ReadFile(h.configFilePath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			if h != nil && h.cfg != nil {
+				data, err = yaml.Marshal(h.cfg)
+				if err == nil {
+					c.Header("Content-Type", "application/yaml; charset=utf-8")
+					c.Header("Cache-Control", "no-store")
+					c.Header("X-Content-Type-Options", "nosniff")
+					_, _ = c.Writer.Write(data)
+					return
+				}
+			}
 			c.JSON(http.StatusNotFound, gin.H{"error": "not_found", "message": "config file not found"})
 			return
 		}
