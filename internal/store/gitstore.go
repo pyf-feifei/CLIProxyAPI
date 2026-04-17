@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -840,15 +841,17 @@ func (s *GitTokenStore) commitAndPushLocked(message string, relPaths ...string) 
 		}
 		return fmt.Errorf("git token store: commit: %w", err)
 	}
-	headRef, errHead := repo.Head()
-	if errHead != nil {
-		if !errors.Is(errHead, plumbing.ErrReferenceNotFound) {
-			return fmt.Errorf("git token store: get head: %w", errHead)
+	if s.shouldCompactHistoryBeforePush() {
+		headRef, errHead := repo.Head()
+		if errHead != nil {
+			if !errors.Is(errHead, plumbing.ErrReferenceNotFound) {
+				return fmt.Errorf("git token store: get head: %w", errHead)
+			}
+		} else if errRewrite := s.rewriteHeadAsSingleCommit(repo, headRef.Name(), commitHash, message, signature); errRewrite != nil {
+			return errRewrite
 		}
-	} else if errRewrite := s.rewriteHeadAsSingleCommit(repo, headRef.Name(), commitHash, message, signature); errRewrite != nil {
-		return errRewrite
+		s.maybeRunGC(repo)
 	}
-	s.maybeRunGC(repo)
 	pushOpts := &git.PushOptions{Auth: s.gitAuth(), Force: true}
 	if s.branch != "" {
 		pushOpts.RefSpecs = []config.RefSpec{config.RefSpec("refs/heads/" + s.branch + ":refs/heads/" + s.branch)}
@@ -865,6 +868,23 @@ func (s *GitTokenStore) commitAndPushLocked(message string, relPaths ...string) 
 		return fmt.Errorf("git token store: push: %w", err)
 	}
 	return nil
+}
+
+// Smart HTTP remotes such as Hugging Face can fail go-git's force-push after
+// local history rewriting/GC with "packfile not found". Keep ordinary history
+// for HTTP(S) remotes and only compact local/SSH-backed stores.
+func (s *GitTokenStore) shouldCompactHistoryBeforePush() bool {
+	remote := strings.TrimSpace(s.remote)
+	if remote == "" {
+		return true
+	}
+	if parsed, err := url.Parse(remote); err == nil {
+		switch strings.ToLower(parsed.Scheme) {
+		case "http", "https":
+			return false
+		}
+	}
+	return true
 }
 
 // rewriteHeadAsSingleCommit rewrites the current branch tip to a single-parentless commit and leaves history squashed.

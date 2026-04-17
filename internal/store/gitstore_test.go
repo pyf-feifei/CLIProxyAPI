@@ -19,6 +19,52 @@ type testBranchSpec struct {
 	contents string
 }
 
+func TestShouldCompactHistoryBeforePush(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	localRemote := filepath.Join(root, "remote.git")
+
+	cases := []struct {
+		name   string
+		remote string
+		want   bool
+	}{
+		{
+			name:   "https remote",
+			remote: "https://huggingface.co/spaces/spongyicybulk/clipgit",
+			want:   false,
+		},
+		{
+			name:   "http remote",
+			remote: "http://example.com/repo.git",
+			want:   false,
+		},
+		{
+			name:   "local path remote",
+			remote: localRemote,
+			want:   true,
+		},
+		{
+			name:   "ssh remote",
+			remote: "git@github.com:router-for-me/CLIProxyAPI.git",
+			want:   true,
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			store := NewGitTokenStore(tc.remote, "", "", "")
+			if got := store.shouldCompactHistoryBeforePush(); got != tc.want {
+				t.Fatalf("shouldCompactHistoryBeforePush() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestEnsureRepositoryUsesRemoteDefaultBranchWhenBranchNotConfigured(t *testing.T) {
 	root := t.TempDir()
 	remoteDir := setupGitRemoteRepository(t, root, "trunk",
