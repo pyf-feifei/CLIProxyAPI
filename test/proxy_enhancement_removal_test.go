@@ -44,6 +44,7 @@ func requireRepoPathMissing(t *testing.T, parts ...string) {
 
 func TestProxyEnhancementArtifactsRemoved(t *testing.T) {
 	dockerfile := readProxyRepoFile(t, "Dockerfile")
+	qwenAuth := readProxyRepoFile(t, "internal", "auth", "qwen", "qwen_auth.go")
 
 	requireRepoPathMissing(t, "deploy-hf.ps1")
 	requireRepoPathMissing(t, "deploy", "hf-profile")
@@ -60,6 +61,18 @@ func TestProxyEnhancementArtifactsRemoved(t *testing.T) {
 	for _, snippet := range forbiddenDockerSnippets {
 		if strings.Contains(dockerfile, snippet) {
 			t.Fatalf("Dockerfile must not contain %q", snippet)
+		}
+	}
+
+	forbiddenQwenSnippets := []string{
+		"HelloChrome_Auto",
+		"X-Dashscope-Useragent",
+		"generateRequestID",
+		"Alibaba Cloud WAF",
+	}
+	for _, snippet := range forbiddenQwenSnippets {
+		if strings.Contains(qwenAuth, snippet) {
+			t.Fatalf("internal/auth/qwen/qwen_auth.go must not contain %q", snippet)
 		}
 	}
 }
