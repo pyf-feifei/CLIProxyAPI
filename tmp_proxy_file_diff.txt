@@ -1,0 +1,724 @@
+diff --git a/Dockerfile b/Dockerfile
+index 3e10c4f9..ef07ee28 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -1,35 +1,52 @@
+ FROM golang:1.26-alpine AS builder
+ 
+ WORKDIR /app
+ 
+ COPY go.mod go.sum ./
+ 
+ RUN go mod download
+ 
+ COPY . .
+ 
+ ARG VERSION=dev
+ ARG COMMIT=none
+ ARG BUILD_DATE=unknown
+ 
+-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./CLIProxyAPI ./cmd/server/
++RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./server ./cmd/server/
+ 
+ FROM alpine:3.22.0
+ 
+-RUN apk add --no-cache tzdata
++RUN apk add --no-cache tzdata unzip
++
++# Download xray-core for linux amd64
++RUN wget -O /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip" \
++    && unzip /tmp/xray.zip -d /usr/local/bin xray \
++    && chmod +x /usr/local/bin/xray \
++    && rm /tmp/xray.zip
+ 
+ RUN mkdir /CLIProxyAPI
+ 
+-COPY --from=builder ./app/CLIProxyAPI /CLIProxyAPI/CLIProxyAPI
++COPY --from=builder ./app/server /CLIProxyAPI/server
+ 
+ COPY config.example.yaml /CLIProxyAPI/config.example.yaml
+ 
++# Use example config as default so the app can start (e.g. Hugging Face Spaces)
++RUN cp /CLIProxyAPI/config.example.yaml /CLIProxyAPI/config.yaml
++# Route traffic through local xray SOCKS5 proxy
++RUN sed -i 's|proxy-url: ""|proxy-url: "socks5://127.0.0.1:10808"|' /CLIProxyAPI/config.yaml
++
++COPY xray-config.json /CLIProxyAPI/xray-config.json
++COPY start.sh /CLIProxyAPI/start.sh
++RUN chmod +x /CLIProxyAPI/start.sh
++
+ WORKDIR /CLIProxyAPI
+ 
+ EXPOSE 8317
+ 
+ ENV TZ=Asia/Shanghai
++# Cloud deploy mode: allow startup without config, stand by for configuration
++ENV DEPLOY=cloud
+ 
+ RUN cp /usr/share/zoneinfo/${TZ} /etc/localtime && echo "${TZ}" > /etc/timezone
+ 
+-CMD ["./CLIProxyAPI"]
+\ No newline at end of file
++CMD ["./start.sh"]
+diff --git a/deploy-hf.ps1 b/deploy-hf.ps1
+new file mode 100644
+index 00000000..8a19220e
+--- /dev/null
++++ b/deploy-hf.ps1
+@@ -0,0 +1,192 @@
++# Hugging Face Spaces 部署脚本
++# 使用前请先登录: huggingface-cli login 或 hf auth login
++# 或设置环境变量: $env:HF_TOKEN = "your_token"
++
++param(
++    [Parameter(Mandatory=$true)]
++    [string]$HfUsername,
++    
++    [string]$SpaceName = "CLIProxyAPI"
++)
++
++$ErrorActionPreference = "Stop"
++$repoUrl = "https://huggingface.co/spaces/$HfUsername/$SpaceName"
++$sourceRoot = (Resolve-Path (Join-Path $PSScriptRoot ".")).Path
++$hfProfileRoot = Join-Path $sourceRoot "deploy\hf-profile"
++$hfOverlayFiles = @(
++    @{ Source = Join-Path $hfProfileRoot "Dockerfile"; Destination = "Dockerfile" },
++    @{ Source = Join-Path $hfProfileRoot "start.sh"; Destination = "start.sh" }
++)
++$hfDeleteFiles = @(
++    "xray-config.json"
++)
++$hfExtraFiles = @(
++    "static/management.html"
++)
++
++function Invoke-Git {
++    param(
++        [Parameter(Mandatory=$true)]
++        [string[]]$Arguments,
++
++        [string]$WorkingDirectory = $sourceRoot
++    )
++
++    & git -C $WorkingDirectory @Arguments
++    if ($LASTEXITCODE -ne 0) {
++        throw "git command failed: git -C $WorkingDirectory $($Arguments -join ' ')"
++    }
++}
++
++function Export-HfSnapshot {
++    param(
++        [Parameter(Mandatory=$true)]
++        [string]$DestinationRoot
++    )
++
++    # Hugging Face Spaces rejects binary objects in regular git history.
++    # Export a clean tracked-files snapshot and skip image assets that trigger pre-receive rejection.
++    $trackedFiles = & git -C $sourceRoot ls-files
++    if ($LASTEXITCODE -ne 0) {
++        throw "failed to enumerate tracked files from $sourceRoot"
++    }
++
++    foreach ($relativePath in $trackedFiles) {
++        if ($relativePath -match '\.(png|jpg|jpeg|gif|webp)$') {
++            continue
++        }
++
++        $sourcePath = Join-Path $sourceRoot $relativePath
++        if (-not (Test-Path $sourcePath -PathType Leaf)) {
++            continue
++        }
++
++        $targetPath = Join-Path $DestinationRoot $relativePath
++        $targetDir = Split-Path $targetPath -Parent
++        if ($targetDir -and -not (Test-Path $targetDir)) {
++            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
++        }
++
++        Copy-Item $sourcePath $targetPath -Force
++    }
++
++    foreach ($relativePath in $hfExtraFiles) {
++        $sourcePath = Join-Path $sourceRoot $relativePath
++        if (-not (Test-Path $sourcePath -PathType Leaf)) {
++            continue
++        }
++
++        $targetPath = Join-Path $DestinationRoot $relativePath
++        $targetDir = Split-Path $targetPath -Parent
++        if ($targetDir -and -not (Test-Path $targetDir)) {
++            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
++        }
++
++        Copy-Item $sourcePath $targetPath -Force
++    }
++}
++
++function Assert-HfDeployGuard {
++    if (-not (Test-Path $hfProfileRoot -PathType Container)) {
++        throw "HF deploy profile directory not found: $hfProfileRoot"
++    }
++
++    foreach ($overlay in $hfOverlayFiles) {
++        if (-not (Test-Path $overlay.Source -PathType Leaf)) {
++            throw "HF deploy overlay file not found: $($overlay.Source)"
++        }
++    }
++
++    Write-Host "运行 HF 部署保护测试..." -ForegroundColor Cyan
++    & go test ./test -run TestHFDeployProfileGuard
++    if ($LASTEXITCODE -ne 0) {
++        throw "HF deploy guard test failed"
++    }
++}
++
++function Copy-HfOverlay {
++    param(
++        [Parameter(Mandatory=$true)]
++        [string]$DestinationRoot
++    )
++
++    Write-Host "应用 HF 覆盖层..." -ForegroundColor Cyan
++
++    foreach ($overlay in $hfOverlayFiles) {
++        $targetPath = Join-Path $DestinationRoot $overlay.Destination
++        $targetDir = Split-Path $targetPath -Parent
++        if ($targetDir -and -not (Test-Path $targetDir)) {
++            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
++        }
++
++        Copy-Item $overlay.Source $targetPath -Force
++    }
++
++    foreach ($relativePath in $hfDeleteFiles) {
++        $targetPath = Join-Path $DestinationRoot $relativePath
++        if (Test-Path $targetPath) {
++            Remove-Item $targetPath -Force
++        }
++    }
++}
++
++Write-Host "=== CLIProxyAPI Hugging Face Spaces 部署 ===" -ForegroundColor Cyan
++Write-Host "目标: $repoUrl" -ForegroundColor Gray
++
++# 检查是否已登录
++$whoami = hf auth whoami 2>$null
++if (-not $whoami) {
++    Write-Host "`n错误: 未登录 Hugging Face" -ForegroundColor Red
++    Write-Host "请先运行: huggingface-cli login" -ForegroundColor Yellow
++    Write-Host "或设置: `$env:HF_TOKEN = 'your_read_token'" -ForegroundColor Yellow
++    exit 1
++}
++
++Write-Host "已登录: $whoami" -ForegroundColor Green
++
++Write-Host "源目录: $sourceRoot" -ForegroundColor Gray
++
++$tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("CLIProxyAPI-hf-" + [Guid]::NewGuid().ToString("N"))
++
++try {
++    Assert-HfDeployGuard
++
++    New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
++    Export-HfSnapshot -DestinationRoot $tempRoot
++    Copy-HfOverlay -DestinationRoot $tempRoot
++
++    Invoke-Git -WorkingDirectory $tempRoot -Arguments @("init", "-b", "main")
++
++    $gitUserName = (& git -C $sourceRoot config user.name).Trim()
++    $gitUserEmail = (& git -C $sourceRoot config user.email).Trim()
++    if ($gitUserName) {
++        Invoke-Git -WorkingDirectory $tempRoot -Arguments @("config", "user.name", $gitUserName)
++    }
++    if ($gitUserEmail) {
++        Invoke-Git -WorkingDirectory $tempRoot -Arguments @("config", "user.email", $gitUserEmail)
++    }
++
++    Invoke-Git -WorkingDirectory $tempRoot -Arguments @("add", ".")
++    if ($hfExtraFiles.Count -gt 0) {
++        Invoke-Git -WorkingDirectory $tempRoot -Arguments (@("add", "--force", "--") + $hfExtraFiles)
++    }
++    Invoke-Git -WorkingDirectory $tempRoot -Arguments @("commit", "-m", "Deploy CLIProxyAPI to Hugging Face Spaces")
++    $pushRepoUrl = $repoUrl
++    $hfToken = [Environment]::GetEnvironmentVariable("HF_TOKEN")
++    if ($hfToken) {
++        $pushRepoUrl = "https://${HfUsername}:$hfToken@huggingface.co/spaces/$HfUsername/$SpaceName"
++    }
++
++    Invoke-Git -WorkingDirectory $tempRoot -Arguments @("remote", "add", "hf", $pushRepoUrl)
++
++    Write-Host "`n正在推送 Hugging Face 快照..." -ForegroundColor Cyan
++    Invoke-Git -WorkingDirectory $tempRoot -Arguments @("push", "hf", "main:main", "--force")
++} finally {
++    if (Test-Path $tempRoot) {
++        Remove-Item $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
++    }
++}
++
++Write-Host "`n部署完成!" -ForegroundColor Green
++Write-Host "Space 地址: https://huggingface.co/spaces/$HfUsername/$SpaceName" -ForegroundColor Cyan
++Write-Host "构建将自动开始，请稍候在 Space 页面查看状态。" -ForegroundColor Gray
+diff --git a/deploy/hf-profile/Dockerfile b/deploy/hf-profile/Dockerfile
+new file mode 100644
+index 00000000..f4d3ad3d
+--- /dev/null
++++ b/deploy/hf-profile/Dockerfile
+@@ -0,0 +1,60 @@
++FROM golang:1.26-alpine AS builder
++
++WORKDIR /app
++
++COPY go.mod go.sum ./
++
++RUN go mod download
++
++COPY . .
++
++ARG VERSION=dev
++ARG COMMIT=none
++ARG BUILD_DATE=unknown
++
++RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w -X 'main.Version=${VERSION}' -X 'main.Commit=${COMMIT}' -X 'main.BuildDate=${BUILD_DATE}'" -o ./server ./cmd/server/
++
++FROM alpine:3.22.0
++
++RUN apk add --no-cache tzdata gzip curl
++
++# Download mihomo (Clash Meta) for linux amd64 and use it as the only HF Qwen OAuth proxy path.
++RUN set -ex && \
++    MIHOMO_DL_URL=$(wget -qO- "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest" | \
++      grep '"browser_download_url"' | grep 'mihomo-linux-amd64' | grep '\.gz"' | grep -v compatible | head -1 | \
++      sed 's/.*"browser_download_url": *"//;s/".*//') && \
++    echo "Downloading mihomo from: $MIHOMO_DL_URL" && \
++    wget -O /tmp/mihomo.gz "$MIHOMO_DL_URL" && \
++    gunzip /tmp/mihomo.gz && \
++    chmod +x /tmp/mihomo && \
++    mv /tmp/mihomo /usr/local/bin/mihomo && \
++    rm -f /tmp/mihomo.gz
++
++RUN mkdir /CLIProxyAPI
++
++COPY --from=builder ./app/server /CLIProxyAPI/server
++RUN mkdir -p /CLIProxyAPI/static
++
++COPY config.example.yaml /CLIProxyAPI/config.example.yaml
++COPY static/management.html /CLIProxyAPI/static/management.html
++
++# HF deploys use config.yaml as a single proxy source of truth for Qwen OAuth.
++RUN cp /CLIProxyAPI/config.example.yaml /CLIProxyAPI/config.yaml
++RUN sed -i 's|proxy-url: ""|proxy-url: "socks5://127.0.0.1:10808"|' /CLIProxyAPI/config.yaml
++
++COPY start.sh /CLIProxyAPI/start.sh
++RUN chmod +x /CLIProxyAPI/start.sh
++
++WORKDIR /CLIProxyAPI
++
++EXPOSE 8317
++
++ENV TZ=Asia/Shanghai
++ENV DEPLOY=cloud
++ENV MANAGEMENT_STATIC_PATH=/CLIProxyAPI/static
++# Set CLASH_SUB_URL to a Clash subscription URL to enable the HF-only Qwen proxy bootstrap.
++# Leave it empty to disable the proxy and restore direct traffic in config.yaml before startup.
++
++RUN cp /usr/share/zoneinfo/${TZ} /etc/localtime && echo "${TZ}" > /etc/timezone
++
++CMD ["./start.sh"]
+diff --git a/deploy/hf-profile/README.md b/deploy/hf-profile/README.md
+new file mode 100644
+index 00000000..ce74bb01
+--- /dev/null
++++ b/deploy/hf-profile/README.md
+@@ -0,0 +1,21 @@
++# HF Deploy Profile
++
++This directory is the only source of truth for Hugging Face Spaces deployment overrides.
++
++Why it exists:
++
++- `main` may continue to track upstream Docker/startup files.
++- HF deployment needs a separate, known-good Qwen proxy bootstrap flow.
++- Future upstream merges must not silently switch HF back to the legacy `xray` path.
++
++Rules:
++
++- HF deployment must overlay files from this directory on top of the exported repository snapshot.
++- HF deployment must remove `xray-config.json` from the snapshot.
++- Qwen OAuth must keep using `cfg.ProxyURL` as the single proxy source of truth.
++- Do not add `QWEN_AUTH_PROXY_URL` back as a second HF-only runtime path.
++- HF startup must fail fast when `CLASH_SUB_URL`, mihomo config generation, or the Qwen proxy probe is broken.
++- HF startup must not silently clear `proxy-url` and continue serving a deployment that cannot complete Qwen OAuth.
++- HF startup must probe candidate nodes against the real Qwen OAuth endpoint before serving traffic.
++- HF startup must lock Qwen traffic to a verified node via a `select` group.
++- HF startup must not use `url-test`, `auto`, or gstatic probes for Qwen routing.
+diff --git a/deploy/hf-profile/start.sh b/deploy/hf-profile/start.sh
+new file mode 100644
+index 00000000..fd86ea55
+--- /dev/null
++++ b/deploy/hf-profile/start.sh
+@@ -0,0 +1,263 @@
++#!/bin/sh
++
++set -eu
++
++CLASH_SUB_URL="${CLASH_SUB_URL:-}"
++MIHOMO_WORKDIR="/CLIProxyAPI"
++MIHOMO_CONFIG="$MIHOMO_WORKDIR/mihomo-config.yaml"
++CLASH_SUB_FILE="/tmp/clash-sub.yaml"
++PROXIES_BLOCK_FILE="/tmp/proxies-block.yaml"
++PROXY_NAMES_FILE="/tmp/proxy-names.txt"
++QWEN_PROXY_URL="socks5://127.0.0.1:10808"
++QWEN_PROXY_PROBE_URL="https://chat.qwen.ai/api/v1/oauth2/device/code"
++QWEN_PROXY_PROBE_BODY="client_id=f0304373b74a44d2b584a3fb70ca9e56&scope=openid%20profile%20email%20model.completion&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&code_challenge_method=S256"
++QWEN_USER_AGENT="QwenCode/0.12.0 (linux; x64)"
++SUBSCRIPTION_USER_AGENT="Clash.Meta"
++QWEN_SELECTED_PROXY=""
++MIHOMO_PID=""
++
++fail_proxy_bootstrap() {
++    echo "FATAL: $1" >&2
++    exit 1
++}
++
++require_proxy_url_configured() {
++    if ! grep -q 'proxy-url: "socks5://127.0.0.1:10808"' /CLIProxyAPI/config.yaml; then
++        fail_proxy_bootstrap "config.yaml no longer points Qwen traffic at $QWEN_PROXY_URL"
++    fi
++}
++
++download_subscription() {
++    echo "Downloading Clash subscription..."
++    if ! curl --fail --silent --show-error --location --connect-timeout 30 --max-time 60 \
++        --user-agent "$SUBSCRIPTION_USER_AGENT" \
++        -H 'Accept: application/x-yaml,text/yaml,application/octet-stream,*/*' \
++        -o "$CLASH_SUB_FILE" \
++        "$CLASH_SUB_URL"; then
++        fail_proxy_bootstrap "failed to download subscription"
++    fi
++    if [ ! -s "$CLASH_SUB_FILE" ]; then
++        fail_proxy_bootstrap "downloaded subscription is empty"
++    fi
++
++    tr -d '\r' < "$CLASH_SUB_FILE" > "${CLASH_SUB_FILE}.normalized"
++    mv "${CLASH_SUB_FILE}.normalized" "$CLASH_SUB_FILE"
++}
++
++extract_proxies_block() {
++    if ! grep -q '^[[:space:]]*proxies:[[:space:]]*$' "$CLASH_SUB_FILE"; then
++        fail_proxy_bootstrap "subscription does not contain a proxies section"
++    fi
++
++    awk '
++/^[[:space:]]*proxies:[[:space:]]*$/ { found=1 }
++found && /^[^[:space:]-][^:]*:[[:space:]]*$/ && !/^[[:space:]]*proxies:[[:space:]]*$/ { exit }
++found { print }
++' "$CLASH_SUB_FILE" > "$PROXIES_BLOCK_FILE"
++
++    if [ ! -s "$PROXIES_BLOCK_FILE" ]; then
++        fail_proxy_bootstrap "failed to extract proxies block from subscription"
++    fi
++}
++
++extract_inline_proxy_name() {
++    line="$1"
++    value=${line#*name:}
++    value=$(printf '%s' "$value" | sed 's/^[[:space:]]*//')
++
++    case "$value" in
++        \"*)
++            value=${value#\"}
++            value=${value%%\"*}
++            ;;
++        \'*)
++            value=${value#\'}
++            value=${value%%\'*}
++            ;;
++        *)
++            value=${value%%,*}
++            value=$(printf '%s' "$value" | sed 's/[[:space:]]*$//')
++            ;;
++    esac
++
++    printf '%s\n' "$value"
++}
++
++extract_proxy_names() {
++    : > "$PROXY_NAMES_FILE"
++
++    while IFS= read -r line; do
++        extract_inline_proxy_name "$line" >> "$PROXY_NAMES_FILE"
++    done <<EOF
++$(grep '^ *- {name:' "$PROXIES_BLOCK_FILE" || true)
++EOF
++
++    grep '^ *- name:' "$PROXIES_BLOCK_FILE" | sed 's/^[[:space:]]*-[[:space:]]*name:[[:space:]]*//' >> "$PROXY_NAMES_FILE" || true
++
++    if [ -s "$PROXY_NAMES_FILE" ]; then
++        sed -i 's/[[:space:]]*#.*$//' "$PROXY_NAMES_FILE"
++        sed -i 's/^"//;s/"$//' "$PROXY_NAMES_FILE"
++        sed -i "s/^'//;s/'$//" "$PROXY_NAMES_FILE"
++        awk 'NF && !seen[$0]++ { print }' "$PROXY_NAMES_FILE" > "${PROXY_NAMES_FILE}.dedup"
++        mv "${PROXY_NAMES_FILE}.dedup" "$PROXY_NAMES_FILE"
++    fi
++
++    PROXY_COUNT=$(wc -l < "$PROXY_NAMES_FILE" | tr -d ' ')
++    echo "Found $PROXY_COUNT proxy nodes"
++    if [ "${PROXY_COUNT:-0}" -eq 0 ]; then
++        fail_proxy_bootstrap "no proxy nodes found in subscription"
++    fi
++}
++
++yaml_escape() {
++    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
++}
++
++write_mihomo_config() {
++    selected_proxy_name=$(yaml_escape "$1")
++
++    {
++        cat << 'HEADER'
++socks-port: 10808
++port: 10809
++allow-lan: false
++mode: rule
++log-level: warning
++ipv6: false
++tcp-concurrent: true
++unified-delay: true
++
++HEADER
++
++        cat "$PROXIES_BLOCK_FILE"
++
++        cat <<MID
++
++proxy-groups:
++  - name: qwen
++    type: select
++    proxies:
++      - "$selected_proxy_name"
++
++rules:
++  - DOMAIN,portal.qwen.ai,DIRECT
++  - DOMAIN-SUFFIX,qwen.ai,qwen
++  - MATCH,DIRECT
++MID
++    } > "$MIHOMO_CONFIG"
++
++    echo "=== Generated mihomo config (first 30 lines) ==="
++    sed -n '1,30p' "$MIHOMO_CONFIG"
++    echo "=== Qwen proxy group ==="
++    grep -A5 'type: select' "$MIHOMO_CONFIG" || true
++    echo "==="
++}
++
++validate_mihomo_config() {
++    echo "Validating mihomo config..."
++    if ! mihomo -t -f "$MIHOMO_CONFIG" >/tmp/mihomo-validate.log 2>&1; then
++        cat /tmp/mihomo-validate.log >&2 || true
++        fail_proxy_bootstrap "mihomo config validation failed"
++    fi
++}
++
++stop_mihomo() {
++    if [ -n "$MIHOMO_PID" ] && kill -0 "$MIHOMO_PID" 2>/dev/null; then
++        kill "$MIHOMO_PID" 2>/dev/null || true
++        wait "$MIHOMO_PID" 2>/dev/null || true
++    fi
++    MIHOMO_PID=""
++}
++
++start_mihomo() {
++    echo "Starting mihomo proxy..."
++    mihomo -d "$MIHOMO_WORKDIR" -f "$MIHOMO_CONFIG" >/tmp/mihomo.log 2>&1 &
++    MIHOMO_PID=$!
++
++    sleep 3
++
++    if ! kill -0 "$MIHOMO_PID" 2>/dev/null; then
++        cat /tmp/mihomo.log >&2 || true
++        MIHOMO_PID=""
++        fail_proxy_bootstrap "mihomo failed to start"
++    fi
++
++    echo "mihomo started (pid=$MIHOMO_PID)"
++}
++
++probe_qwen_proxy() {
++    HTTP_CODE="$({
++        curl --silent --show-error --output /tmp/qwen-proxy-check.out --write-out '%{http_code}' --max-time 20 \
++            --socks5-hostname 127.0.0.1:10808 \
++            -X POST "$QWEN_PROXY_PROBE_URL" \
++            -H 'Content-Type: application/x-www-form-urlencoded' \
++            -H 'Accept: application/json' \
++            -H 'Accept-Language: zh-CN,zh;q=0.9,en;q=0.8' \
++            -H 'Origin: vscode-file://vscode-app' \
++            -H 'Referer: https://chat.qwen.ai/' \
++            -H "User-Agent: $QWEN_USER_AGENT" \
++            -H "X-Dashscope-Useragent: $QWEN_USER_AGENT" \
++            -H 'x-request-id: hf-proxy-probe' \
++            --data "$QWEN_PROXY_PROBE_BODY"
++    } || printf '000')"
++
++    case "$HTTP_CODE" in
++        200)
++            echo "Qwen OAuth probe succeeded"
++            return 0
++            ;;
++        400|401|403)
++            echo "Qwen OAuth probe reached upstream (HTTP $HTTP_CODE)"
++            return 0
++            ;;
++        *)
++            cat /tmp/qwen-proxy-check.out >&2 || true
++            echo "Qwen OAuth probe failed through mihomo (HTTP $HTTP_CODE)" >&2
++            return 1
++            ;;
++    esac
++}
++
++probe_qwen_proxy_for_candidate() {
++    candidate_name="$1"
++
++    echo "Probing Qwen OAuth with candidate proxy: $candidate_name"
++    write_mihomo_config "$candidate_name"
++    validate_mihomo_config
++    start_mihomo
++
++    if probe_qwen_proxy; then
++        QWEN_SELECTED_PROXY="$candidate_name"
++        return 0
++    fi
++
++    stop_mihomo
++    return 1
++}
++
++select_working_qwen_proxy() {
++    while IFS= read -r candidate_name; do
++        candidate_name=$(echo "$candidate_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
++        [ -z "$candidate_name" ] && continue
++
++        if probe_qwen_proxy_for_candidate "$candidate_name"; then
++            echo "Locked Qwen OAuth traffic to proxy node: $candidate_name"
++            return 0
++        fi
++    done < "$PROXY_NAMES_FILE"
++
++    fail_proxy_bootstrap "no working proxy node could reach Qwen OAuth"
++}
++
++if [ -z "$CLASH_SUB_URL" ]; then
++    fail_proxy_bootstrap "CLASH_SUB_URL is required for HF Qwen OAuth deployment"
++fi
++
++require_proxy_url_configured
++download_subscription
++extract_proxies_block
++extract_proxy_names
++select_working_qwen_proxy
++
++echo "Qwen OAuth proxy selection complete: $QWEN_SELECTED_PROXY"
++exec ./server
+diff --git a/start.sh b/start.sh
+new file mode 100644
+index 00000000..113cd0a4
+--- /dev/null
++++ b/start.sh
+@@ -0,0 +1,14 @@
++#!/bin/sh
++echo "Starting xray-core proxy..."
++xray run -config /CLIProxyAPI/xray-config.json &
++XRAY_PID=$!
++
++sleep 2
++
++if kill -0 "$XRAY_PID" 2>/dev/null; then
++    echo "xray-core started (pid=$XRAY_PID)"
++else
++    echo "WARNING: xray-core failed to start, continuing without proxy"
++fi
++
++exec ./server
+diff --git a/xray-config.json b/xray-config.json
+new file mode 100644
+index 00000000..1c8c642c
+--- /dev/null
++++ b/xray-config.json
+@@ -0,0 +1,76 @@
++{
++  "log": {
++    "loglevel": "warning"
++  },
++  "inbounds": [
++    {
++      "tag": "socks-in",
++      "port": 10808,
++      "listen": "127.0.0.1",
++      "protocol": "socks",
++      "settings": {
++        "udp": true
++      }
++    },
++    {
++      "tag": "http-in",
++      "port": 10809,
++      "listen": "127.0.0.1",
++      "protocol": "http"
++    }
++  ],
++  "outbounds": [
++    {
++      "tag": "proxy",
++      "protocol": "vless",
++      "settings": {
++        "vnext": [
++          {
++            "address": "54.219.67.136",
++            "port": 30006,
++            "users": [
++              {
++                "id": "2506263d-6f74-4f37-9fa1-a52faeea4e17",
++                "encryption": "none",
++                "flow": ""
++              }
++            ]
++          }
++        ]
++      },
++      "streamSettings": {
++        "network": "tcp",
++        "security": "reality",
++        "realitySettings": {
++          "serverName": "yahoo.com",
++          "fingerprint": "chrome",
++          "publicKey": "wLza9VY_4UgYEpdxFMt3Z8faPRGbp3ZQ7-HYeDz1pkM",
++          "shortId": "a97cb2d0f3bd",
++          "spiderX": "/"
++        }
++      }
++    },
++    {
++      "tag": "direct",
++      "protocol": "freedom"
++    }
++  ],
++  "routing": {
++    "domainStrategy": "IPIfNonMatch",
++    "rules": [
++      {
++        "type": "field",
++        "domain": [
++          "domain:qwen.ai",
++          "domain:dashscope.aliyuncs.com"
++        ],
++        "outboundTag": "proxy"
++      },
++      {
++        "type": "field",
++        "network": "tcp,udp",
++        "outboundTag": "direct"
++      }
++    ]
++  }
++}

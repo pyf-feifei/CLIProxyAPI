@@ -1,0 +1,759 @@
+diff --git a/internal/api/handlers/management/auth_files.go b/internal/api/handlers/management/auth_files.go
+index 30662dfe..35eb2fd6 100644
+--- a/internal/api/handlers/management/auth_files.go
++++ b/internal/api/handlers/management/auth_files.go
+@@ -1007,40 +1007,41 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
+ 
+ 	authID := h.authIDForPath(path)
+ 	if authID == "" {
+ 		authID = path
+ 	}
+ 	attr := map[string]string{
+ 		"path":   path,
+ 		"source": path,
+ 	}
+ 	auth := &coreauth.Auth{
+ 		ID:         authID,
+ 		Provider:   provider,
+ 		FileName:   filepath.Base(path),
+ 		Label:      label,
+ 		Status:     coreauth.StatusActive,
+ 		Attributes: attr,
+ 		Metadata:   metadata,
+ 		CreatedAt:  time.Now(),
+ 		UpdatedAt:  time.Now(),
+ 	}
++	coreauth.HydrateRuntimeStateFromMetadata(auth)
+ 	if hasLastRefresh {
+ 		auth.LastRefreshedAt = lastRefresh
+ 	}
+ 	if h != nil && h.authManager != nil {
+ 		if existing, ok := h.authManager.GetByID(authID); ok {
+ 			auth.CreatedAt = existing.CreatedAt
+ 			if !hasLastRefresh {
+ 				auth.LastRefreshedAt = existing.LastRefreshedAt
+ 			}
+ 			auth.NextRefreshAfter = existing.NextRefreshAfter
+ 			auth.Runtime = existing.Runtime
+ 		}
+ 	}
+ 	coreauth.ApplyCustomHeadersFromMetadata(auth)
+ 	return auth, nil
+ }
+ 
+ func (h *Handler) upsertAuthRecord(ctx context.Context, auth *coreauth.Auth) error {
+ 	if h == nil || h.authManager == nil || auth == nil {
+ 		return nil
+@@ -2100,41 +2101,44 @@ func (h *Handler) RequestAntigravityToken(c *gin.Context) {
+ 		fmt.Println("You can now use Antigravity services through this CLI")
+ 	}()
+ 
+ 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+ }
+ 
+ func (h *Handler) RequestQwenToken(c *gin.Context) {
+ 	ctx := context.Background()
+ 	ctx = PopulateAuthContext(ctx, c)
+ 
+ 	fmt.Println("Initializing Qwen authentication...")
+ 
+ 	state := fmt.Sprintf("gem-%d", time.Now().UnixNano())
+ 	// Initialize Qwen auth service
+ 	qwenAuth := qwen.NewQwenAuth(h.cfg)
+ 
+ 	// Generate authorization URL
+ 	deviceFlow, err := qwenAuth.InitiateDeviceFlow(ctx)
+ 	if err != nil {
+ 		log.Errorf("Failed to generate authorization URL: %v", err)
+-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
++		c.JSON(http.StatusInternalServerError, gin.H{
++			"error":   "failed to generate authorization url",
++			"message": err.Error(),
++		})
+ 		return
+ 	}
+ 	authURL := deviceFlow.VerificationURIComplete
+ 
+ 	RegisterOAuthSession(state, "qwen")
+ 
+ 	go func() {
+ 		fmt.Println("Waiting for authentication...")
+ 		tokenData, errPollForToken := qwenAuth.PollForToken(deviceFlow.DeviceCode, deviceFlow.CodeVerifier)
+ 		if errPollForToken != nil {
+ 			SetOAuthSessionError(state, "Authentication failed")
+ 			fmt.Printf("Authentication failed: %v\n", errPollForToken)
+ 			return
+ 		}
+ 
+ 		// Create token storage
+ 		tokenStorage := qwenAuth.CreateTokenStorage(tokenData)
+ 
+ 		tokenStorage.Email = fmt.Sprintf("%d", time.Now().UnixMilli())
+ 		record := &coreauth.Auth{
+diff --git a/internal/config/config.go b/internal/config/config.go
+index 15847f57..a41254a8 100644
+--- a/internal/config/config.go
++++ b/internal/config/config.go
+@@ -1,32 +1,33 @@
+ // Package config provides configuration management for the CLI Proxy API server.
+ // It handles loading and parsing YAML configuration files, and provides structured
+ // access to application settings including server port, authentication directory,
+ // debug settings, proxy configuration, and API keys.
+ package config
+ 
+ import (
+ 	"bytes"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"os"
++	"strconv"
+ 	"strings"
+ 	"syscall"
+ 
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+ 	log "github.com/sirupsen/logrus"
+ 	"golang.org/x/crypto/bcrypt"
+ 	"gopkg.in/yaml.v3"
+ )
+ 
+ const (
+ 	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+ 	DefaultPprofAddr             = "127.0.0.1:8316"
+ )
+ 
+ // Config represents the application's configuration, loaded from a YAML file.
+ type Config struct {
+ 	SDKConfig `yaml:",inline"`
+ 	// Host is the network host/interface on which the API server will bind.
+ 	// Default is empty ("") to bind all interfaces (IPv4 + IPv6). Use "127.0.0.1" or "localhost" for local-only access.
+ 	Host string `yaml:"host" json:"-"`
+@@ -654,40 +655,48 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
+ 	cfg.SanitizeCodexHeaderDefaults()
+ 
+ 	// Sanitize Claude header defaults.
+ 	cfg.SanitizeClaudeHeaderDefaults()
+ 
+ 	// Sanitize Claude key headers
+ 	cfg.SanitizeClaudeKeys()
+ 
+ 	// Sanitize OpenAI compatibility providers: drop entries without base-url
+ 	cfg.SanitizeOpenAICompatibility()
+ 
+ 	// Normalize OAuth provider model exclusion map.
+ 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)
+ 
+ 	// Normalize global OAuth model name aliases.
+ 	cfg.SanitizeOAuthModelAlias()
+ 
+ 	// Validate raw payload rules and drop invalid entries.
+ 	cfg.SanitizePayloadRules()
+ 
++	// PaaS platforms (Hugging Face Spaces, Heroku, etc.) inject PORT at runtime.
++	// Override config port when PORT is set so the app binds to the expected port.
++	if portEnv := strings.TrimSpace(os.Getenv("PORT")); portEnv != "" {
++		if p, err := strconv.Atoi(portEnv); err == nil && p > 0 {
++			cfg.Port = p
++		}
++	}
++
+ 	// NOTE: Legacy migration persistence is intentionally disabled together with
+ 	// startup legacy migration to keep startup read-only for config.yaml.
+ 	// Re-enable the block below if automatic startup migration is needed again.
+ 	// if cfg.legacyMigrationPending {
+ 	// 	fmt.Println("Detected legacy configuration keys, attempting to persist the normalized config...")
+ 	// 	if !optional && configFile != "" {
+ 	// 		if err := SaveConfigPreserveComments(configFile, &cfg); err != nil {
+ 	// 			return nil, fmt.Errorf("failed to persist migrated legacy config: %w", err)
+ 	// 		}
+ 	// 		fmt.Println("Legacy configuration normalized and persisted.")
+ 	// 	} else {
+ 	// 		fmt.Println("Legacy configuration normalized in memory; persistence skipped.")
+ 	// 	}
+ 	// }
+ 
+ 	// Return the populated configuration struct.
+ 	return &cfg, nil
+ }
+ 
+ // SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.
+diff --git a/sdk/cliproxy/auth/conductor.go b/sdk/cliproxy/auth/conductor.go
+index 357bf693..19754001 100644
+--- a/sdk/cliproxy/auth/conductor.go
++++ b/sdk/cliproxy/auth/conductor.go
+@@ -1,29 +1,30 @@
+ package auth
+ 
+ import (
+ 	"bytes"
+ 	"context"
+ 	"encoding/json"
+ 	"errors"
+ 	"io"
+ 	"net/http"
++	"os"
+ 	"path/filepath"
+ 	"sort"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/google/uuid"
+ 	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
+ 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+ 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+ 	log "github.com/sirupsen/logrus"
+ )
+ 
+ // ProviderExecutor defines the contract required by Manager to execute provider calls.
+ type ProviderExecutor interface {
+@@ -47,40 +48,41 @@ type ProviderExecutor interface {
+ type ExecutionSessionCloser interface {
+ 	CloseExecutionSession(sessionID string)
+ }
+ 
+ const (
+ 	// CloseAllExecutionSessionsID asks an executor to release all active execution sessions.
+ 	// Executors that do not support this marker may ignore it.
+ 	CloseAllExecutionSessionsID = "__all_execution_sessions__"
+ )
+ 
+ // RefreshEvaluator allows runtime state to override refresh decisions.
+ type RefreshEvaluator interface {
+ 	ShouldRefresh(now time.Time, auth *Auth) bool
+ }
+ 
+ const (
+ 	refreshCheckInterval  = 5 * time.Second
+ 	refreshMaxConcurrency = 16
+ 	refreshPendingBackoff = time.Minute
+ 	refreshFailureBackoff = 5 * time.Minute
++	refreshReauthBackoff  = 24 * time.Hour
+ 	quotaBackoffBase      = time.Second
+ 	quotaBackoffMax       = 30 * time.Minute
+ )
+ 
+ var quotaCooldownDisabled atomic.Bool
+ 
+ // SetQuotaCooldownDisabled toggles quota cooldown scheduling globally.
+ func SetQuotaCooldownDisabled(disable bool) {
+ 	quotaCooldownDisabled.Store(disable)
+ }
+ 
+ func quotaCooldownDisabledForAuth(auth *Auth) bool {
+ 	if auth != nil {
+ 		if override, ok := auth.DisableCoolingOverride(); ok {
+ 			return override
+ 		}
+ 	}
+ 	return quotaCooldownDisabled.Load()
+ }
+ 
+@@ -2817,44 +2819,47 @@ func (m *Manager) persist(ctx context.Context, auth *Auth) error {
+ 	if auth.Metadata == nil {
+ 		return nil
+ 	}
+ 	_, err := m.store.Save(ctx, auth)
+ 	return err
+ }
+ 
+ // StartAutoRefresh launches a background loop that evaluates auth freshness
+ // every few seconds and triggers refresh operations when required.
+ // Only one loop is kept alive; starting a new one cancels the previous run.
+ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duration) {
+ 	if interval <= 0 {
+ 		interval = refreshCheckInterval
+ 	}
+ 	if m.refreshCancel != nil {
+ 		m.refreshCancel()
+ 		m.refreshCancel = nil
+ 	}
+ 	ctx, cancel := context.WithCancel(parent)
+ 	m.refreshCancel = cancel
++	eagerStart := !strings.EqualFold(strings.TrimSpace(os.Getenv("DEPLOY")), "cloud")
+ 	go func() {
+ 		ticker := time.NewTicker(interval)
+ 		defer ticker.Stop()
+-		m.checkRefreshes(ctx)
++		if eagerStart {
++			m.checkRefreshes(ctx)
++		}
+ 		for {
+ 			select {
+ 			case <-ctx.Done():
+ 				return
+ 			case <-ticker.C:
+ 				m.checkRefreshes(ctx)
+ 			}
+ 		}
+ 	}()
+ }
+ 
+ // StopAutoRefresh cancels the background refresh loop, if running.
+ func (m *Manager) StopAutoRefresh() {
+ 	if m.refreshCancel != nil {
+ 		m.refreshCancel()
+ 		m.refreshCancel = nil
+ 	}
+ }
+ 
+ func (m *Manager) checkRefreshes(ctx context.Context) {
+@@ -3130,67 +3135,106 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
+ 	}
+ 	m.mu.RLock()
+ 	auth := m.auths[id]
+ 	var exec ProviderExecutor
+ 	if auth != nil {
+ 		exec = m.executors[auth.Provider]
+ 	}
+ 	m.mu.RUnlock()
+ 	if auth == nil || exec == nil {
+ 		return
+ 	}
+ 	cloned := auth.Clone()
+ 	updated, err := exec.Refresh(ctx, cloned)
+ 	if err != nil && errors.Is(err, context.Canceled) {
+ 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
+ 		return
+ 	}
+ 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
+ 	now := time.Now()
+ 	if err != nil {
++		var persistSnapshot *Auth
+ 		m.mu.Lock()
+ 		if current := m.auths[id]; current != nil {
+-			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
+-			current.LastError = &Error{Message: err.Error()}
++			applyRefreshFailureState(current, err, now)
+ 			m.auths[id] = current
++			current.PersistRuntimeStateToMetadata()
++			persistSnapshot = current.Clone()
+ 			if m.scheduler != nil {
+-				m.scheduler.upsertAuth(current.Clone())
++				m.scheduler.upsertAuth(persistSnapshot)
+ 			}
+ 		}
+ 		m.mu.Unlock()
++		if persistSnapshot != nil {
++			if errPersist := m.persist(context.Background(), persistSnapshot); errPersist != nil {
++				log.Warnf("persist refresh failure state for %s failed: %v", persistSnapshot.ID, errPersist)
++			}
++		}
+ 		return
+ 	}
+ 	if updated == nil {
+ 		updated = cloned
+ 	}
+ 	// Preserve runtime created by the executor during Refresh.
+ 	// If executor didn't set one, fall back to the previous runtime.
+ 	if updated.Runtime == nil {
+ 		updated.Runtime = auth.Runtime
+ 	}
+ 	updated.LastRefreshedAt = now
++	updated.Unavailable = false
++	updated.Status = StatusActive
++	updated.StatusMessage = ""
+ 	updated.NextRefreshAfter = time.Time{}
+ 	updated.LastError = nil
+ 	updated.UpdatedAt = now
+ 	_, _ = m.Update(ctx, updated)
+ }
+ 
++func applyRefreshFailureState(auth *Auth, err error, now time.Time) {
++	if auth == nil {
++		return
++	}
++
++	resultErr := &Error{Message: err.Error()}
++	auth.LastError = resultErr
++	auth.Status = StatusError
++	auth.Unavailable = false
++	auth.UpdatedAt = now
++
++	if isReauthRequiredRefreshError(err) {
++		auth.StatusMessage = "refresh token invalid; sign in again"
++		auth.NextRefreshAfter = now.Add(refreshReauthBackoff)
++		return
++	}
++
++	auth.StatusMessage = "token refresh failed"
++	auth.NextRefreshAfter = now.Add(refreshFailureBackoff)
++}
++
++func isReauthRequiredRefreshError(err error) bool {
++	if err == nil {
++		return false
++	}
++	raw := strings.ToLower(err.Error())
++	return strings.Contains(raw, "refresh_token_reused")
++}
++
+ func (m *Manager) executorFor(provider string) ProviderExecutor {
+ 	m.mu.RLock()
+ 	defer m.mu.RUnlock()
+ 	return m.executors[provider]
+ }
+ 
+ // roundTripperContextKey is an unexported context key type to avoid collisions.
+ type roundTripperContextKey struct{}
+ 
+ // roundTripperFor retrieves an HTTP RoundTripper for the given auth if a provider is registered.
+ func (m *Manager) roundTripperFor(auth *Auth) http.RoundTripper {
+ 	m.mu.RLock()
+ 	p := m.rtProvider
+ 	m.mu.RUnlock()
+ 	if p == nil || auth == nil {
+ 		return nil
+ 	}
+ 	return p.RoundTripperFor(auth)
+ }
+ 
+diff --git a/sdk/cliproxy/auth/types.go b/sdk/cliproxy/auth/types.go
+index 8390b051..ed5f27a9 100644
+--- a/sdk/cliproxy/auth/types.go
++++ b/sdk/cliproxy/auth/types.go
+@@ -1,27 +1,28 @@
+ package auth
+ 
+ import (
+ 	"context"
+ 	"crypto/sha256"
+ 	"encoding/hex"
+ 	"encoding/json"
++	"fmt"
+ 	"net/http"
+ 	"net/url"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"time"
+ 
+ 	baseauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth"
+ )
+ 
+ // PostAuthHook defines a function that is called after an Auth record is created
+ // but before it is persisted to storage. This allows for modification of the
+ // Auth record (e.g., injecting metadata) based on external context.
+ type PostAuthHook func(context.Context, *Auth) error
+ 
+ // RequestInfo holds information extracted from the HTTP request.
+ // It is injected into the context passed to PostAuthHook.
+ type RequestInfo struct {
+ 	Query   url.Values
+ 	Headers http.Header
+@@ -108,68 +109,183 @@ type QuotaState struct {
+ }
+ 
+ // ModelState captures the execution state for a specific model under an auth entry.
+ type ModelState struct {
+ 	// Status reflects the lifecycle status for this model.
+ 	Status Status `json:"status"`
+ 	// StatusMessage provides an optional short description of the status.
+ 	StatusMessage string `json:"status_message,omitempty"`
+ 	// Unavailable mirrors whether the model is temporarily blocked for retries.
+ 	Unavailable bool `json:"unavailable"`
+ 	// NextRetryAfter defines the per-model retry time.
+ 	NextRetryAfter time.Time `json:"next_retry_after"`
+ 	// LastError records the latest error observed for this model.
+ 	LastError *Error `json:"last_error,omitempty"`
+ 	// Quota retains quota information if this model hit rate limits.
+ 	Quota QuotaState `json:"quota"`
+ 	// UpdatedAt tracks the last update timestamp for this model state.
+ 	UpdatedAt time.Time `json:"updated_at"`
+ }
+ 
++const (
++	metadataStatusKey          = "status"
++	metadataStatusMessageKey   = "status_message"
++	metadataUnavailableKey     = "unavailable"
++	metadataNextRefreshAfter   = "next_refresh_after"
++	metadataNextRetryAfter     = "next_retry_after"
++	metadataLastErrorKey       = "last_error"
++	metadataLastRefreshKey     = "last_refresh"
++	metadataLastRefreshedAtKey = "last_refreshed_at"
++)
++
+ // Clone shallow copies the Auth structure, duplicating maps to avoid accidental mutation.
+ func (a *Auth) Clone() *Auth {
+ 	if a == nil {
+ 		return nil
+ 	}
+ 	copyAuth := *a
+ 	if len(a.Attributes) > 0 {
+ 		copyAuth.Attributes = make(map[string]string, len(a.Attributes))
+ 		for key, value := range a.Attributes {
+ 			copyAuth.Attributes[key] = value
+ 		}
+ 	}
+ 	if len(a.Metadata) > 0 {
+ 		copyAuth.Metadata = make(map[string]any, len(a.Metadata))
+ 		for key, value := range a.Metadata {
+ 			copyAuth.Metadata[key] = value
+ 		}
+ 	}
+ 	if len(a.ModelStates) > 0 {
+ 		copyAuth.ModelStates = make(map[string]*ModelState, len(a.ModelStates))
+ 		for key, state := range a.ModelStates {
+ 			copyAuth.ModelStates[key] = state.Clone()
+ 		}
+ 	}
+ 	copyAuth.Runtime = a.Runtime
+ 	return &copyAuth
+ }
+ 
++// PersistRuntimeStateToMetadata mirrors runtime auth state into metadata so stores that only
++// persist metadata can restore refresh cooldowns and operator-facing status after restarts.
++func (a *Auth) PersistRuntimeStateToMetadata() {
++	if a == nil {
++		return
++	}
++	if a.Metadata == nil {
++		a.Metadata = make(map[string]any)
++	}
++
++	a.Metadata["disabled"] = a.Disabled
++
++	if status := strings.TrimSpace(string(a.Status)); status != "" && a.Status != StatusActive {
++		a.Metadata[metadataStatusKey] = status
++	} else {
++		delete(a.Metadata, metadataStatusKey)
++	}
++
++	if msg := strings.TrimSpace(a.StatusMessage); msg != "" {
++		a.Metadata[metadataStatusMessageKey] = msg
++	} else {
++		delete(a.Metadata, metadataStatusMessageKey)
++	}
++
++	if a.Unavailable {
++		a.Metadata[metadataUnavailableKey] = true
++	} else {
++		delete(a.Metadata, metadataUnavailableKey)
++	}
++
++	if !a.LastRefreshedAt.IsZero() {
++		ts := a.LastRefreshedAt.UTC().Format(time.RFC3339)
++		a.Metadata[metadataLastRefreshKey] = ts
++		a.Metadata[metadataLastRefreshedAtKey] = ts
++	} else {
++		delete(a.Metadata, metadataLastRefreshKey)
++		delete(a.Metadata, metadataLastRefreshedAtKey)
++	}
++
++	if !a.NextRefreshAfter.IsZero() {
++		a.Metadata[metadataNextRefreshAfter] = a.NextRefreshAfter.UTC().Format(time.RFC3339)
++	} else {
++		delete(a.Metadata, metadataNextRefreshAfter)
++	}
++
++	if !a.NextRetryAfter.IsZero() {
++		a.Metadata[metadataNextRetryAfter] = a.NextRetryAfter.UTC().Format(time.RFC3339)
++	} else {
++		delete(a.Metadata, metadataNextRetryAfter)
++	}
++
++	if a.LastError != nil {
++		a.Metadata[metadataLastErrorKey] = map[string]any{
++			"code":        strings.TrimSpace(a.LastError.Code),
++			"message":     strings.TrimSpace(a.LastError.Message),
++			"retryable":   a.LastError.Retryable,
++			"http_status": a.LastError.HTTPStatus,
++		}
++	} else {
++		delete(a.Metadata, metadataLastErrorKey)
++	}
++}
++
++// HydrateRuntimeStateFromMetadata restores persisted runtime auth state from metadata.
++func HydrateRuntimeStateFromMetadata(a *Auth) {
++	if a == nil || a.Metadata == nil {
++		return
++	}
++
++	if disabled, ok := parseBoolAny(a.Metadata["disabled"]); ok {
++		a.Disabled = disabled
++	}
++
++	if statusRaw := metadataString(a.Metadata[metadataStatusKey]); statusRaw != "" {
++		a.Status = Status(strings.ToLower(statusRaw))
++	}
++	if a.Disabled {
++		a.Status = StatusDisabled
++	} else if a.Status == "" {
++		a.Status = StatusActive
++	}
++
++	if msg := metadataString(a.Metadata[metadataStatusMessageKey]); msg != "" {
++		a.StatusMessage = msg
++	}
++
++	if unavailable, ok := parseBoolAny(a.Metadata[metadataUnavailableKey]); ok {
++		a.Unavailable = unavailable
++	}
++
++	if ts, ok := lookupMetadataTime(a.Metadata, metadataLastRefreshKey, metadataLastRefreshedAtKey, "lastRefresh", "lastRefreshedAt"); ok {
++		a.LastRefreshedAt = ts
++	}
++	if ts, ok := lookupMetadataTime(a.Metadata, metadataNextRefreshAfter, "nextRefreshAfter"); ok {
++		a.NextRefreshAfter = ts
++	}
++	if ts, ok := lookupMetadataTime(a.Metadata, metadataNextRetryAfter, "nextRetryAfter"); ok {
++		a.NextRetryAfter = ts
++	}
++	if lastErr := metadataError(a.Metadata[metadataLastErrorKey]); lastErr != nil {
++		a.LastError = lastErr
++	}
++}
++
+ func stableAuthIndex(seed string) string {
+ 	seed = strings.TrimSpace(seed)
+ 	if seed == "" {
+ 		return ""
+ 	}
+ 	sum := sha256.Sum256([]byte(seed))
+ 	return hex.EncodeToString(sum[:8])
+ }
+ 
+ func (a *Auth) indexSeed() string {
+ 	if a == nil {
+ 		return ""
+ 	}
+ 
+ 	if fileName := strings.TrimSpace(a.FileName); fileName != "" {
+ 		return "file:" + fileName
+ 	}
+ 
+ 	providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
+ 	compatName := ""
+@@ -337,40 +453,56 @@ func parseBoolAny(val any) (bool, bool) {
+ 			return false, false
+ 		}
+ 		parsed, err := strconv.ParseBool(trimmed)
+ 		if err != nil {
+ 			return false, false
+ 		}
+ 		return parsed, true
+ 	case float64:
+ 		return typed != 0, true
+ 	case json.Number:
+ 		parsed, err := typed.Int64()
+ 		if err != nil {
+ 			return false, false
+ 		}
+ 		return parsed != 0, true
+ 	default:
+ 		return false, false
+ 	}
+ }
+ 
++func metadataString(val any) string {
++	if val == nil {
++		return ""
++	}
++	switch typed := val.(type) {
++	case string:
++		return strings.TrimSpace(typed)
++	case json.Number:
++		return strings.TrimSpace(typed.String())
++	case fmt.Stringer:
++		return strings.TrimSpace(typed.String())
++	default:
++		return strings.TrimSpace(fmt.Sprint(val))
++	}
++}
++
+ func parseIntAny(val any) (int, bool) {
+ 	switch typed := val.(type) {
+ 	case int:
+ 		return typed, true
+ 	case int32:
+ 		return int(typed), true
+ 	case int64:
+ 		return int(typed), true
+ 	case float64:
+ 		return int(typed), true
+ 	case json.Number:
+ 		parsed, err := typed.Int64()
+ 		if err != nil {
+ 			return 0, false
+ 		}
+ 		return int(parsed), true
+ 	case string:
+ 		trimmed := strings.TrimSpace(typed)
+ 		if trimmed == "" {
+ 			return 0, false
+@@ -539,30 +671,69 @@ func parseTimeValue(v any) (time.Time, bool) {
+ 			}
+ 		}
+ 		if unix, err := strconv.ParseInt(s, 10, 64); err == nil {
+ 			return normaliseUnix(unix), true
+ 		}
+ 	case float64:
+ 		return normaliseUnix(int64(value)), true
+ 	case int64:
+ 		return normaliseUnix(value), true
+ 	case json.Number:
+ 		if i, err := value.Int64(); err == nil {
+ 			return normaliseUnix(i), true
+ 		}
+ 		if f, err := value.Float64(); err == nil {
+ 			return normaliseUnix(int64(f)), true
+ 		}
+ 	}
+ 	return time.Time{}, false
+ }
+ 
++func metadataError(raw any) *Error {
++	switch typed := raw.(type) {
++	case nil:
++		return nil
++	case string:
++		msg := strings.TrimSpace(typed)
++		if msg == "" {
++			return nil
++		}
++		return &Error{Message: msg}
++	case map[string]any:
++		err := &Error{}
++		if code := metadataString(typed["code"]); code != "" {
++			err.Code = code
++		}
++		if msg := metadataString(typed["message"]); msg != "" {
++			err.Message = msg
++		}
++		if retryable, ok := parseBoolAny(typed["retryable"]); ok {
++			err.Retryable = retryable
++		}
++		if status, ok := parseIntAny(typed["http_status"]); ok {
++			err.HTTPStatus = status
++		} else if status, ok := parseIntAny(typed["httpStatus"]); ok {
++			err.HTTPStatus = status
++		}
++		if err.Code == "" && err.Message == "" && err.HTTPStatus == 0 && !err.Retryable {
++			return nil
++		}
++		return err
++	default:
++		msg := metadataString(raw)
++		if msg == "" {
++			return nil
++		}
++		return &Error{Message: msg}
++	}
++}
++
+ func normaliseUnix(raw int64) time.Time {
+ 	if raw <= 0 {
+ 		return time.Time{}
+ 	}
+ 	// Heuristic: treat values with millisecond precision (>1e12) accordingly.
+ 	if raw > 1_000_000_000_000 {
+ 		return time.UnixMilli(raw)
+ 	}
+ 	return time.Unix(raw, 0)
+ }
