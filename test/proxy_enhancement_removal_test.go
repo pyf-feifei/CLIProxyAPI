@@ -31,6 +31,21 @@ func readProxyRepoFile(t *testing.T, parts ...string) string {
 	return string(data)
 }
 
+func readProxyRepoFileIfExists(t *testing.T, parts ...string) (string, bool) {
+	t.Helper()
+
+	path := filepath.Join(append([]string{proxyRepoRoot(t)}, parts...)...)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false
+		}
+		t.Fatalf("failed to read %s: %v", path, err)
+	}
+
+	return string(data), true
+}
+
 func requireRepoPathMissing(t *testing.T, parts ...string) {
 	t.Helper()
 
@@ -44,7 +59,7 @@ func requireRepoPathMissing(t *testing.T, parts ...string) {
 
 func TestProxyEnhancementArtifactsRemoved(t *testing.T) {
 	dockerfile := readProxyRepoFile(t, "Dockerfile")
-	qwenAuth := readProxyRepoFile(t, "internal", "auth", "qwen", "qwen_auth.go")
+	qwenAuth, qwenAuthExists := readProxyRepoFileIfExists(t, "internal", "auth", "qwen", "qwen_auth.go")
 
 	requireRepoPathMissing(t, "deploy-hf.ps1")
 	requireRepoPathMissing(t, "deploy", "hf-profile")
@@ -64,15 +79,17 @@ func TestProxyEnhancementArtifactsRemoved(t *testing.T) {
 		}
 	}
 
-	forbiddenQwenSnippets := []string{
-		"HelloChrome_Auto",
-		"X-Dashscope-Useragent",
-		"generateRequestID",
-		"Alibaba Cloud WAF",
-	}
-	for _, snippet := range forbiddenQwenSnippets {
-		if strings.Contains(qwenAuth, snippet) {
-			t.Fatalf("internal/auth/qwen/qwen_auth.go must not contain %q", snippet)
+	if qwenAuthExists {
+		forbiddenQwenSnippets := []string{
+			"HelloChrome_Auto",
+			"X-Dashscope-Useragent",
+			"generateRequestID",
+			"Alibaba Cloud WAF",
+		}
+		for _, snippet := range forbiddenQwenSnippets {
+			if strings.Contains(qwenAuth, snippet) {
+				t.Fatalf("internal/auth/qwen/qwen_auth.go must not contain %q", snippet)
+			}
 		}
 	}
 }

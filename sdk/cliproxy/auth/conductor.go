@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"net/http"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
