@@ -242,6 +242,16 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
 	}
+	if files, err := h.listAuthFilesFromDiskEntries(); err == nil && len(files) > 0 {
+		if auths, ok := h.snapshotAuthManagerEntries(50 * time.Millisecond); ok {
+			files = h.mergeDiskAndManagerAuthEntries(files, auths)
+		}
+		c.JSON(200, gin.H{"files": files})
+		return
+	} else if err != nil && h.authManager == nil {
+		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
+		return
+	}
 	if h.authManager == nil {
 		h.listAuthFilesFromDisk(c)
 		return
@@ -259,6 +269,181 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
 	c.JSON(200, gin.H{"files": files})
+}
+
+func (h *Handler) listAuthFilesFromDiskEntries() ([]gin.H, error) {
+	if h == nil || h.cfg == nil {
+		return nil, nil
+	}
+	entries, err := os.ReadDir(h.cfg.AuthDir)
+	if err != nil {
+		return nil, err
+	}
+
+	files := make([]gin.H, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if !strings.HasSuffix(strings.ToLower(name), ".json") {
+			continue
+		}
+		info, errInfo := e.Info()
+		if errInfo != nil {
+			continue
+		}
+		full := filepath.Join(h.cfg.AuthDir, name)
+		data, errRead := os.ReadFile(full)
+		if errRead == nil {
+			if auth, errBuild := h.buildDiskAuthRecord(full, data, info); errBuild == nil {
+				if entry := h.buildAuthFileEntry(auth); entry != nil {
+					files = append(files, entry)
+					continue
+				}
+			}
+		}
+
+		// Fall back to the minimal file view so malformed files still appear in the UI.
+		fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime(), "source": "file", "path": full}
+		if errRead == nil {
+			typeValue := gjson.GetBytes(data, "type").String()
+			emailValue := gjson.GetBytes(data, "email").String()
+			fileData["type"] = typeValue
+			fileData["provider"] = typeValue
+			fileData["email"] = emailValue
+			if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
+				switch pv.Type {
+				case gjson.Number:
+					fileData["priority"] = int(pv.Int())
+				case gjson.String:
+					if parsed, errAtoi := strconv.Atoi(strings.TrimSpace(pv.String())); errAtoi == nil {
+						fileData["priority"] = parsed
+					}
+				}
+			}
+			if nv := gjson.GetBytes(data, "note"); nv.Exists() && nv.Type == gjson.String {
+				if trimmed := strings.TrimSpace(nv.String()); trimmed != "" {
+					fileData["note"] = trimmed
+				}
+			}
+		}
+		files = append(files, fileData)
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		nameI, _ := files[i]["name"].(string)
+		nameJ, _ := files[j]["name"].(string)
+		return strings.ToLower(nameI) < strings.ToLower(nameJ)
+	})
+	return files, nil
+}
+
+func (h *Handler) snapshotAuthManagerEntries(timeout time.Duration) ([]*coreauth.Auth, bool) {
+	if h == nil || h.authManager == nil {
+		return nil, false
+	}
+	if timeout <= 0 {
+		timeout = 50 * time.Millisecond
+	}
+	resultCh := make(chan []*coreauth.Auth, 1)
+	go func() {
+		resultCh <- h.authManager.List()
+	}()
+	select {
+	case auths := <-resultCh:
+		return auths, true
+	case <-time.After(timeout):
+		return nil, false
+	}
+}
+
+func (h *Handler) mergeDiskAndManagerAuthEntries(files []gin.H, auths []*coreauth.Auth) []gin.H {
+	if len(files) == 0 || len(auths) == 0 {
+		return files
+	}
+
+	managerByName := make(map[string]gin.H, len(auths))
+	authoritativePathByName := make(map[string]string, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		name := strings.TrimSpace(auth.FileName)
+		if name == "" {
+			name = strings.TrimSpace(auth.ID)
+		}
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" {
+			continue
+		}
+		if path := strings.TrimSpace(authAttribute(auth, "path")); path != "" {
+			authoritativePathByName[key] = path
+		}
+		if entry := h.buildAuthFileEntry(auth); entry != nil {
+			managerByName[key] = entry
+		}
+	}
+	if len(managerByName) == 0 && len(authoritativePathByName) == 0 {
+		return files
+	}
+
+	merged := make([]gin.H, 0, len(files))
+	seen := make(map[string]struct{}, len(files))
+	for _, file := range files {
+		name, _ := file["name"].(string)
+		key := strings.ToLower(strings.TrimSpace(name))
+		if key == "" {
+			continue
+		}
+		filePath, _ := file["path"].(string)
+		if authPath, ok := authoritativePathByName[key]; ok && !sameAuthListPath(filePath, authPath) {
+			continue
+		}
+		if managerEntry, ok := managerByName[key]; ok {
+			managerPath, _ := managerEntry["path"].(string)
+			if sameAuthListPath(filePath, managerPath) {
+				merged = append(merged, managerEntry)
+				seen[key] = struct{}{}
+				continue
+			}
+		}
+		merged = append(merged, file)
+		seen[key] = struct{}{}
+	}
+
+	for key, entry := range managerByName {
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		runtimeOnly, _ := entry["runtime_only"].(bool)
+		source, _ := entry["source"].(string)
+		if runtimeOnly || source == "memory" {
+			merged = append(merged, entry)
+		}
+	}
+
+	sort.Slice(merged, func(i, j int) bool {
+		nameI, _ := merged[i]["name"].(string)
+		nameJ, _ := merged[j]["name"].(string)
+		return strings.ToLower(nameI) < strings.ToLower(nameJ)
+	})
+	return merged
+}
+
+func sameAuthListPath(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	if a == "" || b == "" {
+		return a == b
+	}
+	cleanA := filepath.Clean(a)
+	cleanB := filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		cleanA = strings.ToLower(cleanA)
+		cleanB = strings.ToLower(cleanB)
+	}
+	return cleanA == cleanB
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
@@ -311,51 +496,57 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 
 // List auth files from disk when the auth manager is unavailable.
 func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
-	entries, err := os.ReadDir(h.cfg.AuthDir)
+	files, err := h.listAuthFilesFromDiskEntries()
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
 		return
 	}
-	files := make([]gin.H, 0)
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
-		}
-		name := e.Name()
-		if !strings.HasSuffix(strings.ToLower(name), ".json") {
-			continue
-		}
-		if info, errInfo := e.Info(); errInfo == nil {
-			fileData := gin.H{"name": name, "size": info.Size(), "modtime": info.ModTime()}
-
-			// Read file to get type field
-			full := filepath.Join(h.cfg.AuthDir, name)
-			if data, errRead := os.ReadFile(full); errRead == nil {
-				typeValue := gjson.GetBytes(data, "type").String()
-				emailValue := gjson.GetBytes(data, "email").String()
-				fileData["type"] = typeValue
-				fileData["email"] = emailValue
-				if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
-					switch pv.Type {
-					case gjson.Number:
-						fileData["priority"] = int(pv.Int())
-					case gjson.String:
-						if parsed, errAtoi := strconv.Atoi(strings.TrimSpace(pv.String())); errAtoi == nil {
-							fileData["priority"] = parsed
-						}
-					}
-				}
-				if nv := gjson.GetBytes(data, "note"); nv.Exists() && nv.Type == gjson.String {
-					if trimmed := strings.TrimSpace(nv.String()); trimmed != "" {
-						fileData["note"] = trimmed
-					}
-				}
-			}
-
-			files = append(files, fileData)
-		}
-	}
 	c.JSON(200, gin.H{"files": files})
+}
+
+func (h *Handler) buildDiskAuthRecord(path string, data []byte, info os.FileInfo) (*coreauth.Auth, error) {
+	if len(data) == 0 {
+		return nil, fmt.Errorf("auth file is empty")
+	}
+	metadata := make(map[string]any)
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return nil, err
+	}
+	provider, _ := metadata["type"].(string)
+	if provider == "" {
+		provider = "unknown"
+	}
+	label := provider
+	if email, ok := metadata["email"].(string); ok && email != "" {
+		label = email
+	} else if project, ok := metadata["project_id"].(string); ok && project != "" {
+		label = project
+	}
+	authID := h.authIDForPath(path)
+	if authID == "" {
+		authID = filepath.Base(path)
+	}
+	auth := &coreauth.Auth{
+		ID:         authID,
+		Provider:   provider,
+		FileName:   filepath.Base(path),
+		Label:      label,
+		Status:     coreauth.StatusActive,
+		Attributes: map[string]string{"path": path},
+		Metadata:   metadata,
+		CreatedAt:  info.ModTime(),
+		UpdatedAt:  info.ModTime(),
+	}
+	coreauth.HydrateRuntimeStateFromMetadata(auth)
+	if lastRefresh, ok := extractLastRefreshTimestamp(metadata); ok {
+		auth.LastRefreshedAt = lastRefresh
+	}
+	if email, ok := metadata["email"].(string); ok && email != "" {
+		auth.Attributes["email"] = email
+	}
+	coreauth.ApplyCustomHeadersFromMetadata(auth)
+	auth.EnsureIndex()
+	return auth, nil
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
