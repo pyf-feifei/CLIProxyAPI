@@ -6,7 +6,10 @@ import (
 	"strings"
 )
 
-const codexBuiltinImageModelID = "gpt-image-2"
+const (
+	codexBuiltinImageModelID = "gpt-image-2"
+	codexBuiltinGPT55ModelID = "gpt-5.5"
+)
 
 // staticModelsJSON mirrors the top-level structure of models.json.
 type staticModelsJSON struct {
@@ -82,7 +85,7 @@ func GetAntigravityModels() []*ModelInfo {
 // not depend on remote models.json updates. Built-ins replace any matching IDs
 // already present in the provided slice.
 func WithCodexBuiltins(models []*ModelInfo) []*ModelInfo {
-	return upsertModelInfos(models, codexBuiltinImageModelInfo())
+	return upsertModelInfos(models, codexBuiltinImageModelInfo(), codexBuiltinGPT55ModelInfo())
 }
 
 func codexBuiltinImageModelInfo() *ModelInfo {
@@ -94,6 +97,25 @@ func codexBuiltinImageModelInfo() *ModelInfo {
 		Type:        "openai",
 		DisplayName: "GPT Image 2",
 		Version:     codexBuiltinImageModelID,
+	}
+}
+
+func codexBuiltinGPT55ModelInfo() *ModelInfo {
+	return &ModelInfo{
+		ID:                  codexBuiltinGPT55ModelID,
+		Object:              "model",
+		Created:             1776902400,
+		OwnedBy:             "openai",
+		Type:                "openai",
+		DisplayName:         "GPT 5.5",
+		Version:             codexBuiltinGPT55ModelID,
+		Description:         "Frontier model for complex coding, research, and real-world work.",
+		ContextLength:       272000,
+		MaxCompletionTokens: 128000,
+		SupportedParameters: []string{"tools"},
+		Thinking: &ThinkingSupport{
+			Levels: []string{"low", "medium", "high", "xhigh"},
+		},
 	}
 }
 

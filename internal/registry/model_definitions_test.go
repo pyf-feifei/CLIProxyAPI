@@ -27,6 +27,42 @@ func TestCodexStaticModelsIncludeGPT55(t *testing.T) {
 	assertGPT55ModelInfo(t, "lookup", model)
 }
 
+func TestCodexBuiltinsSurviveRemoteCatalogWithoutGPT55Free(t *testing.T) {
+	original := getModels()
+	defer func() {
+		modelsCatalogStore.mu.Lock()
+		modelsCatalogStore.data = original
+		modelsCatalogStore.mu.Unlock()
+	}()
+
+	remoteLike := *original
+	remoteLike.CodexFree = withoutModelID(remoteLike.CodexFree, "gpt-5.5")
+	if findModelInfo(remoteLike.CodexFree, "gpt-5.5") != nil {
+		t.Fatal("test setup failed: remote-like codex-free still contains gpt-5.5")
+	}
+
+	modelsCatalogStore.mu.Lock()
+	modelsCatalogStore.data = &remoteLike
+	modelsCatalogStore.mu.Unlock()
+
+	model := findModelInfo(GetCodexFreeModels(), "gpt-5.5")
+	if model == nil {
+		t.Fatal("expected codex free built-ins to restore gpt-5.5 after remote refresh")
+	}
+	assertGPT55ModelInfo(t, "remote-like free", model)
+}
+
+func withoutModelID(models []*ModelInfo, id string) []*ModelInfo {
+	out := make([]*ModelInfo, 0, len(models))
+	for _, model := range models {
+		if model != nil && model.ID == id {
+			continue
+		}
+		out = append(out, model)
+	}
+	return out
+}
+
 func findModelInfo(models []*ModelInfo, id string) *ModelInfo {
 	for _, model := range models {
 		if model != nil && model.ID == id {
