@@ -1,10 +1,12 @@
 package store
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,6 +14,7 @@ import (
 	gitconfig "github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing"
 	"github.com/go-git/go-git/v6/plumbing/object"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
 type testBranchSpec struct {
@@ -62,6 +65,98 @@ func TestShouldCompactHistoryBeforePush(t *testing.T) {
 				t.Fatalf("shouldCompactHistoryBeforePush() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestGitTokenStoreSaveIsLocalUntilFlush(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "master",
+		testBranchSpec{name: "master", contents: "remote master branch\n"},
+	)
+
+	store := NewGitTokenStore(remoteDir, "", "", "")
+	store.SetBaseDir(filepath.Join(root, "workspace", "auths"))
+	store.syncDebounce = time.Hour
+	if err := store.EnsureRepository(); err != nil {
+		t.Fatalf("EnsureRepository: %v", err)
+	}
+
+	auth := &cliproxyauth.Auth{
+		ID:       "auth.json",
+		FileName: "auth.json",
+		Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "email": "a@example.com"},
+	}
+	path, err := store.Save(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("auth file was not written locally: %v", err)
+	}
+	if _, ok := remoteFileContents(t, remoteDir, "master", "auths/auth.json"); ok {
+		t.Fatal("auth file reached remote before Flush")
+	}
+	if status := store.SyncStatus(); status.PendingFiles == 0 {
+		t.Fatalf("pending files = 0, want queued git sync")
+	}
+
+	if err := store.Flush(context.Background()); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	contents, ok := remoteFileContents(t, remoteDir, "master", "auths/auth.json")
+	if !ok {
+		t.Fatal("auth file missing from remote after Flush")
+	}
+	if !strings.Contains(contents, `"email":"a@example.com"`) {
+		t.Fatalf("remote auth contents = %q, want email", contents)
+	}
+}
+
+func TestGitTokenStoreDeleteFlushesRemovalEvenIfLocalFileAlreadyGone(t *testing.T) {
+	root := t.TempDir()
+	remoteDir := setupGitRemoteRepository(t, root, "master",
+		testBranchSpec{name: "master", contents: "remote master branch\n"},
+	)
+
+	store := NewGitTokenStore(remoteDir, "", "", "")
+	store.SetBaseDir(filepath.Join(root, "workspace", "auths"))
+	store.syncDebounce = time.Hour
+	if err := store.EnsureRepository(); err != nil {
+		t.Fatalf("EnsureRepository: %v", err)
+	}
+
+	auth := &cliproxyauth.Auth{
+		ID:       "auth.json",
+		FileName: "auth.json",
+		Provider: "codex",
+		Metadata: map[string]any{"type": "codex", "email": "delete@example.com"},
+	}
+	path, err := store.Save(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	if err := store.Flush(context.Background()); err != nil {
+		t.Fatalf("initial Flush: %v", err)
+	}
+	if _, ok := remoteFileContents(t, remoteDir, "master", "auths/auth.json"); !ok {
+		t.Fatal("auth file missing from remote before delete")
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove local auth file before Delete: %v", err)
+	}
+
+	if err := store.Delete(context.Background(), path); err != nil {
+		t.Fatalf("Delete missing local file: %v", err)
+	}
+	if status := store.SyncStatus(); status.PendingFiles == 0 {
+		t.Fatalf("pending files = 0, want queued remote deletion")
+	}
+	if err := store.Flush(context.Background()); err != nil {
+		t.Fatalf("delete Flush: %v", err)
+	}
+	if contents, ok := remoteFileContents(t, remoteDir, "master", "auths/auth.json"); ok {
+		t.Fatalf("auth file still exists on remote after delete: %q", contents)
 	}
 }
 
@@ -628,4 +723,34 @@ func assertRemoteBranchContents(t *testing.T, remoteDir, branch, wantContents st
 	if contents != wantContents {
 		t.Fatalf("remote branch %s contents = %q, want %q", branch, contents, wantContents)
 	}
+}
+
+func remoteFileContents(t *testing.T, remoteDir, branch, name string) (string, bool) {
+	t.Helper()
+
+	remoteRepo, err := git.PlainOpen(remoteDir)
+	if err != nil {
+		t.Fatalf("open remote repo: %v", err)
+	}
+	ref, err := remoteRepo.Reference(plumbing.NewBranchReferenceName(branch), false)
+	if err != nil {
+		t.Fatalf("read remote branch %s: %v", branch, err)
+	}
+	commit, err := remoteRepo.CommitObject(ref.Hash())
+	if err != nil {
+		t.Fatalf("read remote branch %s commit: %v", branch, err)
+	}
+	tree, err := commit.Tree()
+	if err != nil {
+		t.Fatalf("read remote branch %s tree: %v", branch, err)
+	}
+	file, err := tree.File(name)
+	if err != nil {
+		return "", false
+	}
+	contents, err := file.Contents()
+	if err != nil {
+		t.Fatalf("read remote branch %s file %s: %v", branch, name, err)
+	}
+	return contents, true
 }

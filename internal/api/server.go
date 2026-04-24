@@ -530,6 +530,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/proxy-url", s.mgmt.DeleteProxyURL)
 
 		mgmt.POST("/api-call", s.mgmt.APICall)
+		mgmt.GET("/gitstore/status", s.mgmt.GetGitStoreStatus)
+		mgmt.POST("/gitstore/flush", s.mgmt.FlushGitStore)
 
 		mgmt.GET("/quota-exceeded/switch-project", s.mgmt.GetSwitchProject)
 		mgmt.PUT("/quota-exceeded/switch-project", s.mgmt.PutSwitchProject)

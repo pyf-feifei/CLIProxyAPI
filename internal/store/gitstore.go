@@ -37,6 +37,20 @@ type GitTokenStore struct {
 	username  string
 	password  string
 	lastGC    time.Time
+
+	syncMu            sync.Mutex
+	syncNotify        chan struct{}
+	syncStarted       bool
+	syncActive        bool
+	pendingPaths      map[string]struct{}
+	pendingMessages   []string
+	needsPush         bool
+	lastSyncAt        time.Time
+	lastPushAt        time.Time
+	lastError         string
+	syncMode          string
+	syncDebounce      time.Duration
+	syncRetryInterval time.Duration
 }
 
 type resolvedRemoteBranch struct {
@@ -49,10 +63,15 @@ type resolvedRemoteBranch struct {
 // When branch is non-empty, clone/pull/push operations target that branch instead of the remote default.
 func NewGitTokenStore(remote, username, password, branch string) *GitTokenStore {
 	return &GitTokenStore{
-		remote:   remote,
-		branch:   strings.TrimSpace(branch),
-		username: username,
-		password: password,
+		remote:            remote,
+		branch:            strings.TrimSpace(branch),
+		username:          username,
+		password:          password,
+		syncNotify:        make(chan struct{}, 1),
+		pendingPaths:      make(map[string]struct{}),
+		syncMode:          defaultGitSyncMode(),
+		syncDebounce:      defaultGitSyncDebounce(),
+		syncRetryInterval: defaultGitSyncRetryInterval(),
 	}
 }
 
@@ -95,6 +114,43 @@ func (s *GitTokenStore) ConfigPath() string {
 		return ""
 	}
 	return filepath.Join(s.configDir, "config.yaml")
+}
+
+func (s *GitTokenStore) ensureLocalWorkspace() error {
+	s.dirLock.Lock()
+	if s.baseDir == "" {
+		s.dirLock.Unlock()
+		return fmt.Errorf("git token store: base directory not configured")
+	}
+	repoDir := s.repoDir
+	if repoDir == "" {
+		repoDir = filepath.Dir(s.baseDir)
+		if repoDir == "" || repoDir == "." {
+			repoDir = s.baseDir
+		}
+		s.repoDir = repoDir
+	}
+	if s.configDir == "" {
+		s.configDir = filepath.Join(repoDir, "config")
+	}
+	baseDir := s.baseDir
+	configDir := s.configDir
+	gitDir := filepath.Join(repoDir, ".git")
+	s.dirLock.Unlock()
+
+	if _, err := os.Stat(gitDir); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return s.EnsureRepository()
+		}
+		return fmt.Errorf("git token store: stat repo: %w", err)
+	}
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
+		return fmt.Errorf("git token store: create auth dir: %w", err)
+	}
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		return fmt.Errorf("git token store: create config dir: %w", err)
+	}
+	return nil
 }
 
 // EnsureRepository prepares the local git working tree by cloning or opening the repository.
@@ -276,42 +332,49 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 		}
 	}
 
-	if err = s.EnsureRepository(); err != nil {
+	if err = s.ensureLocalWorkspace(); err != nil {
 		return "", err
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		s.mu.Unlock()
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
 	}
 
 	switch {
 	case auth.Storage != nil:
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
+			s.mu.Unlock()
 			return "", err
 		}
 	case auth.Metadata != nil:
 		raw, errMarshal := json.Marshal(auth.Metadata)
 		if errMarshal != nil {
+			s.mu.Unlock()
 			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
 		}
 		if existing, errRead := os.ReadFile(path); errRead == nil {
 			if jsonEqual(existing, raw) {
+				s.mu.Unlock()
 				return path, nil
 			}
 		} else if !os.IsNotExist(errRead) {
+			s.mu.Unlock()
 			return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
 		}
 		tmp := path + ".tmp"
 		if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
+			s.mu.Unlock()
 			return "", fmt.Errorf("auth filestore: write temp failed: %w", errWrite)
 		}
 		if errRename := os.Rename(tmp, path); errRename != nil {
+			s.mu.Unlock()
 			return "", fmt.Errorf("auth filestore: rename failed: %w", errRename)
 		}
 	default:
+		s.mu.Unlock()
 		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
 	}
 
@@ -326,13 +389,16 @@ func (s *GitTokenStore) Save(_ context.Context, auth *cliproxyauth.Auth) (string
 
 	relPath, errRel := s.relativeToRepo(path)
 	if errRel != nil {
+		s.mu.Unlock()
 		return "", errRel
 	}
 	messageID := auth.ID
 	if strings.TrimSpace(messageID) == "" {
 		messageID = filepath.Base(path)
 	}
-	if errCommit := s.commitAndPushLocked(fmt.Sprintf("Update auth %s", strings.TrimSpace(messageID)), relPath); errCommit != nil {
+	s.mu.Unlock()
+
+	if errCommit := s.enqueueGitSync(fmt.Sprintf("Update auth %s", strings.TrimSpace(messageID)), relPath); errCommit != nil {
 		return "", errCommit
 	}
 
@@ -384,27 +450,22 @@ func (s *GitTokenStore) Delete(_ context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-	if err = s.EnsureRepository(); err != nil {
+	if err = s.ensureLocalWorkspace(); err != nil {
 		return err
+	}
+	rel, errRel := s.relativeToRepo(path)
+	if errRel != nil {
+		return errRel
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if err = os.Remove(path); err != nil && !os.IsNotExist(err) {
+		s.mu.Unlock()
 		return fmt.Errorf("auth filestore: delete failed: %w", err)
 	}
-	if err == nil {
-		rel, errRel := s.relativeToRepo(path)
-		if errRel != nil {
-			return errRel
-		}
-		messageID := id
-		if errCommit := s.commitAndPushLocked(fmt.Sprintf("Delete auth %s", messageID), rel); errCommit != nil {
-			return errCommit
-		}
-	}
-	return nil
+	s.mu.Unlock()
+
+	return s.enqueueGitSync(fmt.Sprintf("Delete auth %s", id), rel)
 }
 
 // PersistAuthFiles commits and pushes the provided paths to the remote repository.
@@ -413,7 +474,7 @@ func (s *GitTokenStore) PersistAuthFiles(_ context.Context, message string, path
 	if len(paths) == 0 {
 		return nil
 	}
-	if err := s.EnsureRepository(); err != nil {
+	if err := s.ensureLocalWorkspace(); err != nil {
 		return err
 	}
 
@@ -433,13 +494,10 @@ func (s *GitTokenStore) PersistAuthFiles(_ context.Context, message string, path
 		return nil
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if strings.TrimSpace(message) == "" {
 		message = "Sync watcher updates"
 	}
-	return s.commitAndPushLocked(message, filtered...)
+	return s.enqueueGitSync(message, filtered...)
 }
 
 func (s *GitTokenStore) resolveDeletePath(id string) (string, error) {
@@ -814,43 +872,47 @@ func (s *GitTokenStore) commitAndPushLocked(message string, relPaths ...string) 
 		}
 		added = true
 	}
-	if !added {
-		return nil
-	}
 	status, err := worktree.Status()
 	if err != nil {
 		return fmt.Errorf("git token store: status: %w", err)
 	}
-	if status.IsClean() {
+	if !added && !s.remotePushPending() {
 		return nil
 	}
-	if strings.TrimSpace(message) == "" {
-		message = "Update auth store"
-	}
-	signature := &object.Signature{
-		Name:  "CLIProxyAPI",
-		Email: "cliproxy@local",
-		When:  time.Now(),
-	}
-	commitHash, err := worktree.Commit(message, &git.CommitOptions{
-		Author: signature,
-	})
-	if err != nil {
-		if errors.Is(err, git.ErrEmptyCommit) {
+	if status.IsClean() {
+		if !s.remotePushPending() {
 			return nil
 		}
-		return fmt.Errorf("git token store: commit: %w", err)
-	}
-	if s.shouldCompactHistoryBeforePush() {
-		headRef, errHead := repo.Head()
-		if errHead != nil {
-			if !errors.Is(errHead, plumbing.ErrReferenceNotFound) {
-				return fmt.Errorf("git token store: get head: %w", errHead)
-			}
-		} else if errRewrite := s.rewriteHeadAsSingleCommit(repo, headRef.Name(), commitHash, message, signature); errRewrite != nil {
-			return errRewrite
+	} else {
+		if strings.TrimSpace(message) == "" {
+			message = "Update auth store"
 		}
-		s.maybeRunGC(repo)
+		signature := &object.Signature{
+			Name:  "CLIProxyAPI",
+			Email: "cliproxy@local",
+			When:  time.Now(),
+		}
+		commitHash, errCommit := worktree.Commit(message, &git.CommitOptions{
+			Author: signature,
+		})
+		if errCommit != nil {
+			if errors.Is(errCommit, git.ErrEmptyCommit) {
+				return nil
+			}
+			return fmt.Errorf("git token store: commit: %w", errCommit)
+		}
+		s.markRemotePushPending()
+		if s.shouldCompactHistoryBeforePush() {
+			headRef, errHead := repo.Head()
+			if errHead != nil {
+				if !errors.Is(errHead, plumbing.ErrReferenceNotFound) {
+					return fmt.Errorf("git token store: get head: %w", errHead)
+				}
+			} else if errRewrite := s.rewriteHeadAsSingleCommit(repo, headRef.Name(), commitHash, message, signature); errRewrite != nil {
+				return errRewrite
+			}
+			s.maybeRunGC(repo)
+		}
 	}
 	pushOpts := &git.PushOptions{Auth: s.gitAuth(), Force: true}
 	if s.branch != "" {
@@ -863,10 +925,12 @@ func (s *GitTokenStore) commitAndPushLocked(message string, relPaths ...string) 
 	}
 	if err = repo.Push(pushOpts); err != nil {
 		if errors.Is(err, git.NoErrAlreadyUpToDate) {
+			s.markRemotePushComplete()
 			return nil
 		}
 		return fmt.Errorf("git token store: push: %w", err)
 	}
+	s.markRemotePushComplete()
 	return nil
 }
 
@@ -936,7 +1000,7 @@ func (s *GitTokenStore) maybeRunGC(repo *git.Repository) {
 
 // PersistConfig commits and pushes configuration changes to git.
 func (s *GitTokenStore) PersistConfig(_ context.Context) error {
-	if err := s.EnsureRepository(); err != nil {
+	if err := s.ensureLocalWorkspace(); err != nil {
 		return err
 	}
 	configPath := s.ConfigPath()
@@ -949,13 +1013,11 @@ func (s *GitTokenStore) PersistConfig(_ context.Context) error {
 		}
 		return fmt.Errorf("git token store: stat config: %w", err)
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	rel, err := s.relativeToRepo(configPath)
 	if err != nil {
 		return err
 	}
-	return s.commitAndPushLocked("Update config", rel)
+	return s.enqueueGitSync("Update config", rel)
 }
 
 func ensureEmptyFile(path string) error {
