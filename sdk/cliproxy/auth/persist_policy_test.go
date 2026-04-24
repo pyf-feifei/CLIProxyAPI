@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type countingStore struct {
@@ -58,5 +59,69 @@ func TestWithSkipPersist_DisablesRegisterPersistence(t *testing.T) {
 	}
 	if got := store.saveCount.Load(); got != 0 {
 		t.Fatalf("expected 0 Save calls, got %d", got)
+	}
+}
+
+type blockingStore struct {
+	started     chan struct{}
+	release     chan struct{}
+	startedOnce atomic.Bool
+}
+
+func newBlockingStore() *blockingStore {
+	return &blockingStore{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (s *blockingStore) List(context.Context) ([]*Auth, error) { return nil, nil }
+
+func (s *blockingStore) Save(context.Context, *Auth) (string, error) {
+	if s.startedOnce.CompareAndSwap(false, true) {
+		close(s.started)
+	}
+	<-s.release
+	return "", nil
+}
+
+func (s *blockingStore) Delete(context.Context, string) error { return nil }
+
+func TestManagerMarkResult_DoesNotPersistRequestResults(t *testing.T) {
+	store := newBlockingStore()
+	manager := NewManager(store, nil, nil)
+	auth := &Auth{
+		ID:       "auth-1",
+		Provider: "antigravity",
+		Metadata: map[string]any{"type": "antigravity"},
+	}
+	if _, err := manager.Register(WithSkipPersist(context.Background()), auth); err != nil {
+		t.Fatalf("Register(skipPersist) error = %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		manager.MarkResult(context.Background(), Result{
+			AuthID:  auth.ID,
+			Model:   "gpt-5.4",
+			Success: false,
+			Error:   &Error{Message: "upstream timeout", HTTPStatus: 504},
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(200 * time.Millisecond):
+		close(store.release)
+		<-done
+		t.Fatalf("MarkResult blocked on Store.Save")
+	}
+
+	select {
+	case <-store.started:
+		close(store.release)
+		t.Fatalf("Store.Save was called for request result state")
+	case <-time.After(100 * time.Millisecond):
 	}
 }

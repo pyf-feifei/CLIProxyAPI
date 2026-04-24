@@ -313,6 +313,56 @@ func TestIsAuthBlockedForModel_UnavailableWithoutNextRetryIsNotBlocked(t *testin
 	}
 }
 
+func TestIsAuthBlockedForModel_AntigravityWithoutProjectIDIsBlocked(t *testing.T) {
+	t.Parallel()
+
+	auth := &Auth{
+		ID:       "antigravity-incomplete",
+		Provider: "antigravity",
+		Status:   StatusActive,
+		Metadata: map[string]any{"type": "antigravity"},
+	}
+
+	blocked, reason, next := isAuthBlockedForModel(auth, "gpt-5.4", time.Now())
+	if !blocked {
+		t.Fatalf("blocked = false, want true")
+	}
+	if reason != blockReasonOther {
+		t.Fatalf("reason = %v, want %v", reason, blockReasonOther)
+	}
+	if !next.IsZero() {
+		t.Fatalf("next = %v, want zero", next)
+	}
+}
+
+func TestRoundRobinSelectorPick_AntigravitySkipsMissingProjectID(t *testing.T) {
+	t.Parallel()
+
+	selector := &RoundRobinSelector{}
+	good := &Auth{
+		ID:       "good",
+		Provider: "antigravity",
+		Status:   StatusActive,
+		Metadata: map[string]any{"type": "antigravity", "project_id": "project-1"},
+	}
+	bad := &Auth{
+		ID:       "bad",
+		Provider: "antigravity",
+		Status:   StatusActive,
+		Metadata: map[string]any{"type": "antigravity"},
+	}
+
+	for i := 0; i < 3; i++ {
+		got, err := selector.Pick(context.Background(), "antigravity", "gpt-5.4", cliproxyexecutor.Options{}, []*Auth{bad, good})
+		if err != nil {
+			t.Fatalf("Pick() #%d error = %v", i, err)
+		}
+		if got == nil || got.ID != good.ID {
+			t.Fatalf("Pick() #%d auth = %#v, want %q", i, got, good.ID)
+		}
+	}
+}
+
 func TestFillFirstSelectorPick_ThinkingSuffixFallsBackToBaseModelState(t *testing.T) {
 	t.Parallel()
 

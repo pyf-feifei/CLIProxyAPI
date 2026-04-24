@@ -316,9 +316,6 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 				auth.Status = StatusActive
 			}
 			auth.UpdatedAt = now
-			if errPersist := m.persist(ctx, auth); errPersist != nil {
-				logEntryWithRequestID(ctx).WithField("auth_id", auth.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
-			}
 			snapshot = auth.Clone()
 		}
 	}
@@ -326,6 +323,11 @@ func (m *Manager) ReconcileRegistryModelStates(ctx context.Context, authID strin
 
 	if m.scheduler != nil && snapshot != nil {
 		m.scheduler.upsertAuth(snapshot)
+	}
+	if snapshot != nil {
+		if errPersist := m.persist(ctx, snapshot); errPersist != nil {
+			logEntryWithRequestID(ctx).WithField("auth_id", snapshot.ID).Warnf("failed to persist auth changes during model state reconciliation: %v", errPersist)
+		}
 	}
 }
 
@@ -2091,7 +2093,6 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 			}
 		}
 
-		_ = m.persist(ctx, auth)
 		authSnapshot = auth.Clone()
 	}
 	m.mu.Unlock()
