@@ -50,6 +50,22 @@ func TestPatchManagementHTML_IncludesRouteFlashGuardScript(t *testing.T) {
 	}
 }
 
+func TestPatchManagementHTML_IncludesKeyUsagePanel(t *testing.T) {
+	input := []byte("<html><head></head><body><div id='root'></div></body></html>")
+
+	got := string(PatchManagementHTML(input))
+
+	if !strings.Contains(got, managementKeyUsagePanelMarker) {
+		t.Fatalf("expected key usage panel marker in patched html")
+	}
+	if !strings.Contains(got, "API Key Usage Monitor") {
+		t.Fatalf("expected key usage monitor panel in patched html")
+	}
+	if !strings.Contains(got, "/v0/management/api-key-usage") {
+		t.Fatalf("expected key usage API endpoint in patched html")
+	}
+}
+
 func TestManagementSessionPatchScript_HydratesPersistedAuthState(t *testing.T) {
 	if !strings.Contains(managementSessionPatchScript, "key === 'cli-proxy-auth'") {
 		t.Fatalf("expected session patch to intercept cli-proxy-auth reads")
