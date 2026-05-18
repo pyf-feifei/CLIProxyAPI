@@ -58,7 +58,7 @@ func TestPatchManagementHTML_IncludesKeyUsagePanel(t *testing.T) {
 	if !strings.Contains(got, managementKeyUsagePanelMarker) {
 		t.Fatalf("expected key usage panel marker in patched html")
 	}
-	if !strings.Contains(got, "API Key Usage Monitor") {
+	if !strings.Contains(got, "Key 使用监控") {
 		t.Fatalf("expected key usage monitor panel in patched html")
 	}
 	if !strings.Contains(got, "/v0/management/api-key-usage") {
