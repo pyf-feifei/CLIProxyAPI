@@ -40,8 +40,8 @@ func mergeRecentRequestBuckets(dst, src []coreauth.RecentRequestBucket) []coreau
 	return dst
 }
 
-// GetAPIKeyUsage returns recent request buckets for all in-memory auths,
-// grouped by provider and keyed by "base_url|account".
+// GetAPIKeyUsage returns recent request buckets for all in-memory api_key auths,
+// grouped by provider and keyed by "base_url|api_key".
 func (h *Handler) GetAPIKeyUsage(c *gin.Context) {
 	if h == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "handler not initialized"})
@@ -62,18 +62,12 @@ func (h *Handler) GetAPIKeyUsage(c *gin.Context) {
 		if auth == nil {
 			continue
 		}
-		_, account := auth.AccountInfo()
-		account = strings.TrimSpace(account)
-		if account == "" {
-			account = strings.TrimSpace(auth.Label)
+		kind, apiKey := auth.AccountInfo()
+		if !strings.EqualFold(strings.TrimSpace(kind), "api_key") {
+			continue
 		}
-		if account == "" {
-			account = strings.TrimSpace(auth.FileName)
-		}
-		if account == "" {
-			account = strings.TrimSpace(auth.ID)
-		}
-		if account == "" {
+		apiKey = strings.TrimSpace(apiKey)
+		if apiKey == "" {
 			continue
 		}
 		baseURL := ""
@@ -83,7 +77,7 @@ func (h *Handler) GetAPIKeyUsage(c *gin.Context) {
 				baseURL = strings.TrimSpace(auth.Attributes["base-url"])
 			}
 		}
-		compositeKey := baseURL + "|" + account
+		compositeKey := baseURL + "|" + apiKey
 		provider := strings.ToLower(strings.TrimSpace(auth.Provider))
 		if provider == "" {
 			provider = "unknown"
