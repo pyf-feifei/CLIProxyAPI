@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 )
 
 type requestPrepareStore struct {
@@ -97,6 +97,7 @@ func TestManagerExecute_PreparesAndPersistsMissingRequestAuthMetadata(t *testing
 		t.Fatalf("register auth: %v", errRegister)
 	}
 	registry.GetGlobalRegistry().RegisterClient(auth.ID, "antigravity", []*registry.ModelInfo{{ID: model}})
+	manager.RefreshSchedulerEntry(auth.ID)
 	t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
 
 	resp, errExecute := manager.Execute(context.Background(), []string{"antigravity"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})

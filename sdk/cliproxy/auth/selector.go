@@ -375,7 +375,7 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 	if auth.Disabled || auth.Status == StatusDisabled {
 		return true, blockReasonDisabled, time.Time{}
 	}
-	if isAntigravityAuthMissingProjectID(auth) {
+	if isAntigravityAuthMissingProjectID(auth) && !canPrepareAntigravityProjectID(auth) {
 		return true, blockReasonOther, time.Time{}
 	}
 	if model != "" {
@@ -447,6 +447,18 @@ func isAntigravityAuthMissingProjectID(auth *Auth) bool {
 	}
 	projectID, _ := auth.Metadata["project_id"].(string)
 	return strings.TrimSpace(projectID) == ""
+}
+
+func canPrepareAntigravityProjectID(auth *Auth) bool {
+	if auth == nil || len(auth.Metadata) == 0 {
+		return false
+	}
+	for _, key := range []string{"access_token", "refresh_token"} {
+		if value, ok := auth.Metadata[key].(string); ok && strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // sessionPattern matches Claude Code user_id format:
