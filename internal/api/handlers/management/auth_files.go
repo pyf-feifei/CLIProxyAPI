@@ -321,16 +321,6 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
 	}
-	if files, err := h.listAuthFilesFromDiskEntries(); err == nil && len(files) > 0 {
-		if auths, ok := h.snapshotAuthManagerEntries(50 * time.Millisecond); ok {
-			files = h.mergeDiskAndManagerAuthEntries(files, auths)
-		}
-		c.JSON(200, gin.H{"files": files})
-		return
-	} else if err != nil && h.authManager == nil {
-		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
-		return
-	}
 	if h.authManager == nil {
 		h.listAuthFilesFromDisk(c)
 		return
@@ -431,113 +421,6 @@ func (h *Handler) listAuthFilesFromDiskEntries() ([]gin.H, error) {
 		return strings.ToLower(nameI) < strings.ToLower(nameJ)
 	})
 	return files, nil
-}
-
-func (h *Handler) snapshotAuthManagerEntries(timeout time.Duration) ([]*coreauth.Auth, bool) {
-	if h == nil || h.authManager == nil {
-		return nil, false
-	}
-	if timeout <= 0 {
-		timeout = 50 * time.Millisecond
-	}
-	resultCh := make(chan []*coreauth.Auth, 1)
-	go func() {
-		resultCh <- h.authManager.List()
-	}()
-	select {
-	case auths := <-resultCh:
-		return auths, true
-	case <-time.After(timeout):
-		return nil, false
-	}
-}
-
-func (h *Handler) mergeDiskAndManagerAuthEntries(files []gin.H, auths []*coreauth.Auth) []gin.H {
-	if len(files) == 0 || len(auths) == 0 {
-		return files
-	}
-
-	managerByName := make(map[string]gin.H, len(auths))
-	authoritativePathByName := make(map[string]string, len(auths))
-	for _, auth := range auths {
-		if auth == nil {
-			continue
-		}
-		name := strings.TrimSpace(auth.FileName)
-		if name == "" {
-			name = strings.TrimSpace(auth.ID)
-		}
-		key := strings.ToLower(strings.TrimSpace(name))
-		if key == "" {
-			continue
-		}
-		if path := strings.TrimSpace(authAttribute(auth, "path")); path != "" {
-			authoritativePathByName[key] = path
-		}
-		if entry := h.buildAuthFileEntry(auth); entry != nil {
-			managerByName[key] = entry
-		}
-	}
-	if len(managerByName) == 0 && len(authoritativePathByName) == 0 {
-		return files
-	}
-
-	merged := make([]gin.H, 0, len(files))
-	seen := make(map[string]struct{}, len(files))
-	for _, file := range files {
-		name, _ := file["name"].(string)
-		key := strings.ToLower(strings.TrimSpace(name))
-		if key == "" {
-			continue
-		}
-		filePath, _ := file["path"].(string)
-		if authPath, ok := authoritativePathByName[key]; ok && !sameAuthListPath(filePath, authPath) {
-			continue
-		}
-		if managerEntry, ok := managerByName[key]; ok {
-			managerPath, _ := managerEntry["path"].(string)
-			if sameAuthListPath(filePath, managerPath) {
-				merged = append(merged, managerEntry)
-				seen[key] = struct{}{}
-				continue
-			}
-		}
-		merged = append(merged, file)
-		seen[key] = struct{}{}
-	}
-
-	for key, entry := range managerByName {
-		if _, ok := seen[key]; ok {
-			continue
-		}
-		runtimeOnly, _ := entry["runtime_only"].(bool)
-		source, _ := entry["source"].(string)
-		if runtimeOnly || source == "memory" {
-			merged = append(merged, entry)
-		}
-	}
-
-	sort.Slice(merged, func(i, j int) bool {
-		nameI, _ := merged[i]["name"].(string)
-		nameJ, _ := merged[j]["name"].(string)
-		return strings.ToLower(nameI) < strings.ToLower(nameJ)
-	})
-	return merged
-}
-
-func sameAuthListPath(a, b string) bool {
-	a = strings.TrimSpace(a)
-	b = strings.TrimSpace(b)
-	if a == "" || b == "" {
-		return a == b
-	}
-	cleanA := filepath.Clean(a)
-	cleanB := filepath.Clean(b)
-	if runtime.GOOS == "windows" {
-		cleanA = strings.ToLower(cleanA)
-		cleanB = strings.ToLower(cleanB)
-	}
-	return cleanA == cleanB
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file

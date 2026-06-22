@@ -10,10 +10,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
-func TestListAuthFiles_UsesDiskEntriesWhenManagerIsEmpty(t *testing.T) {
+func TestListAuthFiles_UsesDiskEntriesWhenManagerUnavailable(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
 
@@ -24,8 +23,7 @@ func TestListAuthFiles_UsesDiskEntriesWhenManagerIsEmpty(t *testing.T) {
 		t.Fatalf("failed to write auth file: %v", err)
 	}
 
-	manager := coreauth.NewManager(nil, nil, nil)
-	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, nil)
 
 	rec := httptest.NewRecorder()
 	ctx, _ := gin.CreateTestContext(rec)
